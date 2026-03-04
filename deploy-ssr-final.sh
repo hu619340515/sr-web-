@@ -2,7 +2,7 @@
 
 set -e
 
-echo "🚀 开始 SSR 系统一键部署（最终版 v7 · 完全绕过 Drizzle migrate()）..."
+echo "🚀 开始 SSR 系统一键部署（最终版 v8 · 修复顶层 await + 绕过 Drizzle 迁移器）..."
 
 # === 1. 安装基础依赖 ===
 if ! command -v node &> /dev/null; then
@@ -179,44 +179,44 @@ pnpm install
 pnpm add drizzle-orm pg postgres bcrypt
 pnpm add -D drizzle-kit tsx @types/bcrypt dotenv
 
-# === 7. 【关键】生成迁移 SQL 并手动执行 ===
+# === 7. 【关键】生成并手动应用迁移 SQL（修复顶层 await）===
 echo "🔄 生成迁移 SQL..."
 
 mkdir -p drizzle
 
-# 生成迁移文件（如果不存在）
+# 强制生成一次（即使无变化，确保有文件）
 npx drizzle-kit generate
 
-# 找到最新的迁移文件
+# 查找迁移文件
 MIGRATION_FILE=$(find drizzle -name "*.sql" | sort | tail -n1)
 
 if [ -z "$MIGRATION_FILE" ]; then
-  echo "⚠️ 无迁移文件，跳过"
+  echo "⚠️ 未找到迁移 SQL 文件"
 else
   echo "📄 使用迁移文件: $MIGRATION_FILE"
 
-  # 将 SQL 文件内容通过我们的 postgres 客户端执行
+  # ✅ 修复：使用 IIFE 包裹 async/await
   cat > apply-migration.ts << 'EOF'
 import { config } from 'dotenv';
 config({ path: '.env.local' });
 
 import postgres from 'postgres';
-const sql = postgres(process.env.DATABASE_URL!);
-
-// 读取迁移 SQL
 import { readFile } from 'fs/promises';
-const migrationSql = await readFile(process.argv[2], 'utf8');
 
-try {
-  // 执行整个迁移脚本
-  await sql.unsafe(migrationSql);
-  console.log('✅ 迁移 SQL 执行成功');
-} catch (err) {
-  console.error('❌ 迁移失败:', err);
-  process.exit(1);
-} finally {
-  await sql.end();
-}
+// 使用 IIFE 避免顶层 await
+(async () => {
+  const sql = postgres(process.env.DATABASE_URL!);
+  try {
+    const migrationSql = await readFile(process.argv[2], 'utf8');
+    await sql.unsafe(migrationSql);
+    console.log('✅ 迁移 SQL 执行成功');
+  } catch (err) {
+    console.error('❌ 迁移失败:', err);
+    process.exit(1);
+  } finally {
+    await sql.end();
+  }
+})();
 EOF
 
   echo "▶️ 执行迁移 SQL..."

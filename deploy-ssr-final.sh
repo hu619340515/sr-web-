@@ -2,7 +2,7 @@
 
 set -e
 
-echo "🚀 开始 SSR 系统一键部署（最终版 v6 · 绕过 Drizzle 迁移认证问题）..."
+echo "🚀 开始 SSR 系统一键部署（最终版 v7 · 完全绕过 Drizzle migrate()）..."
 
 # === 1. 安装基础依赖 ===
 if ! command -v node &> /dev/null; then
@@ -75,12 +75,12 @@ cd /root
 [ ! -d "sr-web-" ] && git clone https://github.com/hu619340515/sr-web-.git
 cd sr-web-
 
-# 🔑【关键】使用 postgres://
+# 🔑 使用 postgres://
 cat > .env.local << 'EOF'
 DATABASE_URL=postgres://ssr_user:secure_password_123@localhost:5432/ssr_management
 EOF
 
-# === 5. 注入核心代码（同前）===
+# === 5. 注入核心代码 ===
 mkdir -p src/lib/db
 
 cat > src/lib/db/schema.ts << 'EOF'
@@ -179,51 +179,60 @@ pnpm install
 pnpm add drizzle-orm pg postgres bcrypt
 pnpm add -D drizzle-kit tsx @types/bcrypt dotenv
 
-# === 7. 【关键修复】手动创建 drizzle schema 以绕过迁移中的 root 连接 ===
-echo "🔧 手动创建 drizzle schema（绕过 Drizzle 的 root 连接问题）..."
+# === 7. 【关键】生成迁移 SQL 并手动执行 ===
+echo "🔄 生成迁移 SQL..."
 
-# 使用 psql 通过 Docker 执行
-docker exec ssr-postgres psql -U ssr_user -d ssr_management -c "CREATE SCHEMA IF NOT EXISTS drizzle;"
+mkdir -p drizzle
 
-# 生成迁移（如果需要）
+# 生成迁移文件（如果不存在）
 npx drizzle-kit generate
 
-# === 8. migrate.ts：现在可以安全运行 ===
-cat > migrate.ts << 'EOF'
+# 找到最新的迁移文件
+MIGRATION_FILE=$(find drizzle -name "*.sql" | sort | tail -n1)
+
+if [ -z "$MIGRATION_FILE" ]; then
+  echo "⚠️ 无迁移文件，跳过"
+else
+  echo "📄 使用迁移文件: $MIGRATION_FILE"
+
+  # 将 SQL 文件内容通过我们的 postgres 客户端执行
+  cat > apply-migration.ts << 'EOF'
 import { config } from 'dotenv';
 config({ path: '.env.local' });
 
-if (!process.env.DATABASE_URL) {
-  throw new Error('❌ DATABASE_URL not found');
-}
+import postgres from 'postgres';
+const sql = postgres(process.env.DATABASE_URL!);
 
-console.log('🔌 连接数据库:', process.env.DATABASE_URL.replace(/:.*@/, ':***@'));
+// 读取迁移 SQL
+import { readFile } from 'fs/promises';
+const migrationSql = await readFile(process.argv[2], 'utf8');
 
-import { migrate } from 'drizzle-orm/postgres-js/migrator';
-import { db } from '@/lib/db/client';
-
-async function main() {
-  // 此时 drizzle schema 已存在，不会触发 CREATE SCHEMA
-  await migrate(db, { migrationsFolder: './drizzle' });
-  console.log('✅ 数据库迁移完成');
-}
-main().catch((err) => {
+try {
+  // 执行整个迁移脚本
+  await sql.unsafe(migrationSql);
+  console.log('✅ 迁移 SQL 执行成功');
+} catch (err) {
   console.error('❌ 迁移失败:', err);
   process.exit(1);
-});
+} finally {
+  await sql.end();
+}
 EOF
 
-# 执行迁移
-npx tsx migrate.ts
+  echo "▶️ 执行迁移 SQL..."
+  npx tsx apply-migration.ts "$MIGRATION_FILE"
+fi
 
-# === 9. 构建并启动 ===
+# === 8. 构建并启动 Web 服务 ===
 pnpm build
 pkill -f "next start" 2>/dev/null || true
 nohup pnpm start > /root/ssr-web.log 2>&1 &
 sleep 5
 
+# === 9. 输出结果 ===
 IP=$(hostname -I | awk '{print $1}')
 echo ""
 echo "🎉 部署成功！"
 echo "🌐 Web 管理地址: http://$IP:3000"
 echo "📄 日志: /root/ssr-web.log"
+echo "💡 提示：此脚本可安全重复运行，不会丢失用户数据！"

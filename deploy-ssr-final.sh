@@ -2,7 +2,7 @@
 
 set -e
 
-echo "🚀 开始 SSR 系统一键部署（最终版 v5 · 修复 postgres:// 协议问题）..."
+echo "🚀 开始 SSR 系统一键部署（最终版 v6 · 绕过 Drizzle 迁移认证问题）..."
 
 # === 1. 安装基础依赖 ===
 if ! command -v node &> /dev/null; then
@@ -54,7 +54,7 @@ systemctl daemon-reload
 systemctl enable shadowsocksr
 systemctl start shadowsocksr || true
 
-# === 3. 启动 PostgreSQL（保留数据）===
+# === 3. 启动 PostgreSQL ===
 if ! docker ps -a --format '{{.Names}}' | grep -q '^ssr-postgres$'; then
   echo "🆕 创建 PostgreSQL 容器..."
   docker run -d --name ssr-postgres \
@@ -75,12 +75,12 @@ cd /root
 [ ! -d "sr-web-" ] && git clone https://github.com/hu619340515/sr-web-.git
 cd sr-web-
 
-# 🔑【关键修复】使用 postgres:// 而非 postgresql://
+# 🔑【关键】使用 postgres://
 cat > .env.local << 'EOF'
 DATABASE_URL=postgres://ssr_user:secure_password_123@localhost:5432/ssr_management
 EOF
 
-# === 5. 注入核心代码 ===
+# === 5. 注入核心代码（同前）===
 mkdir -p src/lib/db
 
 cat > src/lib/db/schema.ts << 'EOF'
@@ -119,7 +119,6 @@ import { drizzle } from 'drizzle-orm/postgres-js';
 import postgres from 'postgres';
 import * as schema from './schema';
 
-// 必须使用 postgres:// 协议
 const client = postgres(process.env.DATABASE_URL!, { prepare: false });
 export const db = drizzle(client, { schema });
 EOF
@@ -159,29 +158,19 @@ export async function markUserExpired() {
 }
 EOF
 
-# ✅ drizzle.config.ts：显式加载 .env.local + 检查协议
 cat > drizzle.config.ts << 'EOF'
 import type { Config } from 'drizzle-kit';
 import { config } from 'dotenv';
-
 config({ path: '.env.local' });
 
-if (!process.env.DATABASE_URL) {
-  throw new Error('❌ DATABASE_URL is missing in .env.local');
-}
-
-// 检查是否使用正确的协议
-if (!process.env.DATABASE_URL.startsWith('postgres://')) {
-  throw new Error('❌ DATABASE_URL must start with "postgres://", not "postgresql://"');
-}
+if (!process.env.DATABASE_URL) throw new Error('❌ DATABASE_URL missing');
+if (!process.env.DATABASE_URL.startsWith('postgres://')) throw new Error('❌ Use postgres://');
 
 export default {
   schema: './src/lib/db/schema.ts',
   out: './drizzle',
   dialect: 'postgresql',
-  dbCredentials: {
-    url: process.env.DATABASE_URL,
-  },
+  dbCredentials: { url: process.env.DATABASE_URL },
 } satisfies Config;
 EOF
 
@@ -190,46 +179,22 @@ pnpm install
 pnpm add drizzle-orm pg postgres bcrypt
 pnpm add -D drizzle-kit tsx @types/bcrypt dotenv
 
-# === 7. 生成并执行迁移 ===
-echo "🔄 生成数据库迁移..."
+# === 7. 【关键修复】手动创建 drizzle schema 以绕过迁移中的 root 连接 ===
+echo "🔧 手动创建 drizzle schema（绕过 Drizzle 的 root 连接问题）..."
 
-mkdir -p drizzle
+# 使用 psql 通过 Docker 执行
+docker exec ssr-postgres psql -U ssr_user -d ssr_management -c "CREATE SCHEMA IF NOT EXISTS drizzle;"
 
-# 清理旧迁移（可选，确保干净）
-# rm -rf drizzle/*
-
+# 生成迁移（如果需要）
 npx drizzle-kit generate
 
-# tsconfig 支持 @/ 路径
-cat > tsconfig.json << 'EOF'
-{
-  "compilerOptions": {
-    "target": "ES2020",
-    "module": "commonjs",
-    "esModuleInterop": true,
-    "forceConsistentCasingInFileNames": true,
-    "strict": true,
-    "skipLibCheck": true,
-    "baseUrl": ".",
-    "paths": {
-      "@/*": ["./src/*"]
-    }
-  },
-  "include": ["src", "migrate.ts"]
-}
-EOF
-
-# migrate.ts：双重保险
+# === 8. migrate.ts：现在可以安全运行 ===
 cat > migrate.ts << 'EOF'
 import { config } from 'dotenv';
 config({ path: '.env.local' });
 
 if (!process.env.DATABASE_URL) {
-  throw new Error('❌ DATABASE_URL not found in .env.local');
-}
-
-if (!process.env.DATABASE_URL.startsWith('postgres://')) {
-  console.warn('⚠️ WARNING: DATABASE_URL should use "postgres://", not "postgresql://"');
+  throw new Error('❌ DATABASE_URL not found');
 }
 
 console.log('🔌 连接数据库:', process.env.DATABASE_URL.replace(/:.*@/, ':***@'));
@@ -238,9 +203,9 @@ import { migrate } from 'drizzle-orm/postgres-js/migrator';
 import { db } from '@/lib/db/client';
 
 async function main() {
+  // 此时 drizzle schema 已存在，不会触发 CREATE SCHEMA
   await migrate(db, { migrationsFolder: './drizzle' });
   console.log('✅ 数据库迁移完成');
-  process.exit(0);
 }
 main().catch((err) => {
   console.error('❌ 迁移失败:', err);
@@ -248,19 +213,17 @@ main().catch((err) => {
 });
 EOF
 
-echo "▶️ 执行迁移..."
+# 执行迁移
 npx tsx migrate.ts
 
-# === 8. 构建并启动 Web 服务 ===
+# === 9. 构建并启动 ===
 pnpm build
 pkill -f "next start" 2>/dev/null || true
 nohup pnpm start > /root/ssr-web.log 2>&1 &
 sleep 5
 
-# === 9. 输出结果 ===
 IP=$(hostname -I | awk '{print $1}')
 echo ""
 echo "🎉 部署成功！"
 echo "🌐 Web 管理地址: http://$IP:3000"
 echo "📄 日志: /root/ssr-web.log"
-echo "💡 提示：此脚本可安全重复运行，不会丢失用户数据！"

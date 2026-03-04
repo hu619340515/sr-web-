@@ -2,7 +2,7 @@
 
 set -e
 
-echo "🚀 开始 SSR 系统一键部署（最终版 · Drizzle v1+ 兼容 · 增量安全）..."
+echo "🚀 开始 SSR 系统一键部署（最终版 v3 · Drizzle v1+ · 修复 .env 加载）..."
 
 # === 1. 安装基础依赖（仅当缺失时）===
 if ! command -v node &> /dev/null; then
@@ -82,12 +82,11 @@ else
   fi
 fi
 
-# === 4. 部署 Web 项目 ===
+# === 4. 部署 Web 项目 + 强制正确 .env.local ===
 cd /root
 if [ ! -d "sr-web-" ]; then
   git clone https://github.com/hu619340515/sr-web-.git
 else
-  echo "🔄 更新 sr-web- 代码..."
   cd sr-web-
   git pull origin main || echo "⚠️ Git pull 失败，使用当前代码"
   cd ..
@@ -95,14 +94,12 @@ fi
 
 cd sr-web-
 
-# .env.local（如果不存在则创建）
-if [ ! -f ".env.local" ]; then
-  cat > .env.local << 'EOF'
+# 🔒 强制写入正确的 .env.local（关键修复）
+cat > .env.local << 'EOF'
 DATABASE_URL=postgresql://ssr_user:secure_password_123@localhost:5432/ssr_management
 EOF
-else
-  echo "✅ .env.local 已存在"
-fi
+
+echo "✅ .env.local 已配置"
 
 # === 5. 注入核心代码（含 Drizzle v1+ 正确配置）===
 mkdir -p src/lib/db
@@ -227,7 +224,7 @@ export async function markUserExpired() {
 }
 EOF
 
-# ✅ 关键修复：Drizzle v1+ 正确配置
+# ✅ Drizzle v1+ 正确配置
 cat > drizzle.config.ts << 'EOF'
 import type { Config } from 'drizzle-kit';
 
@@ -247,7 +244,7 @@ pnpm install
 pnpm add drizzle-orm pg postgres bcrypt
 pnpm add -D drizzle-kit tsx @types/bcrypt dotenv
 
-# === 7. 生成并执行数据库迁移（Drizzle v1+）===
+# === 7. 生成并执行数据库迁移（关键：显式加载 .env.local）===
 echo "🔄 生成数据库迁移..."
 
 mkdir -p drizzle
@@ -280,9 +277,17 @@ cat > tsconfig.json << 'EOF'
 }
 EOF
 
-# 创建迁移执行脚本
+# ✅ 关键修复：显式加载 .env.local
 cat > migrate.ts << 'EOF'
-import 'dotenv/config';
+import { config } from 'dotenv';
+config({ path: '.env.local' });
+
+if (!process.env.DATABASE_URL) {
+  throw new Error('❌ DATABASE_URL 未设置！请检查 .env.local 文件');
+}
+
+console.log('🔌 连接数据库:', process.env.DATABASE_URL.replace(/:.*@/, ':***@'));
+
 import { migrate } from 'drizzle-orm/postgres-js/migrator';
 import { db } from '@/lib/db/client';
 
@@ -291,6 +296,7 @@ async function main() {
   console.log('✅ 数据库迁移完成');
   process.exit(0);
 }
+
 main().catch((err) => {
   console.error('❌ 迁移失败:', err);
   process.exit(1);

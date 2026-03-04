@@ -1,31 +1,46 @@
 #!/bin/bash
+
 set -e
 
-echo "🚀 开始部署 SSR 系统（ROOT 模式 + 自动清理 + 迁移修复）..."
+echo "🚀 开始增量部署 SSR 系统（ROOT 模式，保留数据）..."
 
-# === 1. 安装依赖 ===
-apt update
-DEBIAN_FRONTEND=noninteractive apt install -y curl git wget python3 python3-pip build-essential ca-certificates gnupg lsb-release software-properties-common
+# === 1. 安装基础依赖（仅当缺失时）===
+if ! command -v node &> /dev/null; then
+  echo "🔧 安装 Node.js、Python、Docker、Git..."
+  apt update
+  DEBIAN_FRONTEND=noninteractive apt install -y \
+    curl git wget python3 python3-pip build-essential \
+    ca-certificates gnupg lsb-release software-properties-common
 
-curl -fsSL https://deb.nodesource.com/setup_18.x | bash -
-apt install -y nodejs
-npm install -g pnpm
+  # Node.js 18
+  curl -fsSL https://deb.nodesource.com/setup_18.x | bash -
+  apt install -y nodejs
+  npm install -g pnpm
 
-install -m 0755 -d /etc/apt/keyrings
-curl -fsSL https://download.docker.com/linux/ubuntu/gpg | gpg --dearmor -o /etc/apt/keyrings/docker.gpg
-echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu $(lsb_release -cs) stable" | tee /etc/apt/sources.list.d/docker.list > /dev/null
-apt update
-DEBIAN_FRONTEND=noninteractive apt install -y docker-ce docker-ce-cli containerd.io docker-compose-plugin
-systemctl enable --now docker
+  # Docker
+  install -m 0755 -d /etc/apt/keyrings
+  curl -fsSL https://download.docker.com/linux/ubuntu/gpg | gpg --dearmor -o /etc/apt/keyrings/docker.gpg
+  echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu $(lsb_release -cs) stable" | tee /etc/apt/sources.list.d/docker.list > /dev/null
+  apt update
+  DEBIAN_FRONTEND=noninteractive apt install -y docker-ce docker-ce-cli containerd.io docker-compose-plugin
+  systemctl enable --now docker
+else
+  echo "✅ Node.js 已安装，跳过依赖安装"
+fi
 
-# === 2. 安装 ShadowsocksR（自动清理旧目录）===
-echo "📦 安装 ShadowsocksR..."
+# === 2. 增量部署 ShadowsocksR ===
+echo "📦 部署 ShadowsocksR（增量）..."
 cd /opt
-rm -rf shadowsocksr  # 👈 关键：清理旧目录
-git clone -b akkariiin/master https://github.com/shadowsocksrr/shadowsocksr.git
+if [ ! -d "shadowsocksr" ]; then
+  git clone -b akkariiin/master https://github.com/shadowsocksrr/shadowsocksr.git
+else
+  echo "⚠️ /opt/shadowsocksr 已存在，跳过克隆"
+fi
+
 mkdir -p /etc/shadowsocks
 touch /etc/shadowsocks/config.json
 
+# 写入服务文件（总是覆盖，确保最新）
 cat > /etc/systemd/system/shadowsocksr.service << 'EOF'
 [Unit]
 Description=ShadowsocksR Server
@@ -46,25 +61,65 @@ EOF
 systemctl daemon-reload
 systemctl enable shadowsocksr
 
-# === 3. 启动 PostgreSQL ===
-docker run -d --name ssr-postgres -e POSTGRES_DB=ssr_management -e POSTGRES_USER=ssr_user -e POSTGRES_PASSWORD=secure_password_123 -p 5432:5432 --restart unless-stopped postgres:15
-sleep 15
+# 启动 SSR（如果未运行）
+if ! systemctl is-active --quiet shadowsocksr; then
+  systemctl start shadowsocksr
+  echo "✅ SSR 服务已启动"
+else
+  echo "✅ SSR 服务已在运行"
+fi
 
-# === 4. 部署 Web 项目（也清理旧项目避免冲突）===
+# === 3. 增量启动 PostgreSQL ===
+echo "🗃️  启动 PostgreSQL（增量）..."
+if ! docker ps -a --format '{{.Names}}' | grep -q '^ssr-postgres$'; then
+  echo "🆕 创建新 PostgreSQL 容器..."
+  docker run -d \
+    --name ssr-postgres \
+    -e POSTGRES_DB=ssr_management \
+    -e POSTGRES_USER=ssr_user \
+    -e POSTGRES_PASSWORD=secure_password_123 \
+    -p 5432:5432 \
+    --restart unless-stopped \
+    postgres:15
+  sleep 15
+else
+  if ! docker ps --format '{{.Names}}' | grep -q '^ssr-postgres$'; then
+    echo "🔄 启动已存在的 PostgreSQL 容器..."
+    docker start ssr-postgres
+    sleep 5
+  else
+    echo "✅ PostgreSQL 已在运行"
+  fi
+fi
+
+# === 4. 部署 Web 项目（增量）===
 cd /root
-rm -rf sr-web-
-git clone https://github.com/hu619340515/sr-web-.git
+if [ ! -d "sr-web-" ]; then
+  git clone https://github.com/hu619340515/sr-web-.git
+else
+  echo "🔄 更新 sr-web- 代码..."
+  cd sr-web-
+  git pull origin main || echo "⚠️ Git pull 失败，继续使用当前代码"
+  cd ..
+fi
+
 cd sr-web-
 
-cat > .env.local << 'EOF'
+# .env.local（如果不存在则创建）
+if [ ! -f ".env.local" ]; then
+  cat > .env.local << 'EOF'
 DATABASE_URL=postgresql://ssr_user:secure_password_123@localhost:5432/ssr_management
 EOF
+else
+  echo "✅ .env.local 已存在，跳过创建"
+fi
 
-# === 5. 注入代码（略，同前）===
+# === 5. 注入必要代码（覆盖更新）===
 mkdir -p src/lib/db
 
 cat > src/lib/db/schema.ts << 'EOF'
 import { pgTable, serial, text, timestamp, integer, boolean } from 'drizzle-orm/pg-core';
+
 export const users = pgTable('users', {
   id: serial('id').primaryKey(),
   username: text('username').notNull().unique(),
@@ -82,6 +137,7 @@ export const users = pgTable('users', {
   status: text('status').notNull(),
   createdAt: timestamp('created_at').defaultNow(),
 });
+
 export const scheduledTasks = pgTable('scheduled_tasks', {
   id: serial('id').primaryKey(),
   name: text('name').notNull(),
@@ -98,6 +154,7 @@ cat > src/lib/db/client.ts << 'EOF'
 import { drizzle } from 'drizzle-orm/postgres-js';
 import postgres from 'postgres';
 import * as schema from './schema';
+
 const client = postgres(process.env.DATABASE_URL!, { prepare: false });
 export const db = drizzle(client, { schema });
 EOF
@@ -112,26 +169,69 @@ import { promisify } from 'util';
 const execAsync = promisify(exec);
 
 async function updateSSRConfig() {
-  const allUsers = await db.select({ port: users.port, password: users.passwordHash, method: users.method, protocol: users.protocol, obfs: users.obfs }).from(users).where(eq(users.status, 'normal'));
-  const config = { server: "0.0.0.0", local_address: "127.0.0.1", local_port: 1080, port_password: Object.fromEntries(allUsers.map(u => [String(u.port), u.password])), timeout: 120, method: "aes-256-cfb", protocol: "origin", obfs: "plain", redirect: "", dns_ipv6: false, fast_open: false, workers: 1 };
+  const allUsers = await db.select({
+    port: users.port,
+    password: users.passwordHash,
+    method: users.method,
+    protocol: users.protocol,
+    obfs: users.obfs,
+  }).from(users).where(eq(users.status, 'normal'));
+
+  const config = {
+    server: "0.0.0.0",
+    local_address: "127.0.0.1",
+    local_port: 1080,
+    port_password: Object.fromEntries(allUsers.map(u => [String(u.port), u.password])),
+    timeout: 120,
+    method: "aes-256-cfb",
+    protocol: "origin",
+    obfs: "plain",
+    redirect: "",
+    dns_ipv6: false,
+    fast_open: false,
+    workers: 1
+  };
+
   await fs.writeFile('/etc/shadowsocks/config.json', JSON.stringify(config, null, 2));
-  try { await execAsync('systemctl restart shadowsocksr'); } catch (e) { console.warn('⚠️ SSR 重启失败'); }
+  try {
+    await execAsync('systemctl restart shadowsocksr');
+  } catch (e) {
+    console.warn('⚠️ SSR 重启失败');
+  }
 }
 
 export async function createUser(input) {
-  const userData = { username: input.username, email: input.email, passwordHash: input.password, port: input.port, method: input.method, protocol: input.protocol || 'origin', obfs: input.obfs || 'plain', protoparam: '', obfsparam: '', trafficLimit: input.trafficLimit, expiresAt: input.expiresAt, status: 'normal' };
+  const userData = {
+    username: input.username,
+    email: input.email,
+    passwordHash: input.password,
+    port: input.port,
+    method: input.method,
+    protocol: input.protocol || 'origin',
+    obfs: input.obfs || 'plain',
+    protoparam: '',
+    obfsparam: '',
+    trafficLimit: input.trafficLimit,
+    expiresAt: input.expiresAt,
+    status: 'normal',
+  };
   const result = await db.insert(users).values(userData).returning();
   await updateSSRConfig();
   return result[0];
 }
+
 export async function getUsers() { return await db.select().from(users).orderBy(users.id); }
 export async function getUserById(id) { const r = await db.select().from(users).where(eq(users.id, id)).limit(1); return r[0]; }
 export async function updateUser(id, data) { const r = await db.update(users).set(data).where(eq(users.id, id)).returning(); await updateSSRConfig(); return r[0] || null; }
 export async function deleteUser(id) { const r = await db.delete(users).where(eq(users.id, id)); await updateSSRConfig(); return r.count > 0; }
 export async function getUserByPort(port) { const r = await db.select().from(users).where(eq(users.port, port)).limit(1); return r[0]; }
+
 export async function markUserExpired() {
   const now = new Date();
-  const r = await db.update(users).set({ status: 'expired' }).where(sql`${users.expiresAt} <= ${now} AND ${users.status} = 'normal'`).returning({ id: users.id });
+  const r = await db.update(users)
+    .set({ status: 'expired' })
+    .where(sql`${users.expiresAt} <= ${now} AND ${users.status} = 'normal'`)
+    .returning({ id: users.id });
   await updateSSRConfig();
   return r.length;
 }
@@ -139,34 +239,87 @@ EOF
 
 cat > drizzle.config.ts << 'EOF'
 import type { Config } from 'drizzle-kit';
-export default { schema: './src/lib/db/schema.ts', out: './drizzle', driver: 'pg', dbCredentials: { connectionString: process.env.DATABASE_URL! }, } satisfies Config;
+export default {
+  schema: './src/lib/db/schema.ts',
+  out: './drizzle',
+  driver: 'pg',
+  dbCredentials: {
+    connectionString: process.env.DATABASE_URL!,
+  },
+} satisfies Config;
 EOF
 
-# === 6. 安装依赖 & 迁移 ===
+# === 6. 安装依赖（增量）===
+echo "📦 安装/更新依赖..."
 pnpm install
 pnpm add drizzle-orm pg postgres bcrypt
-pnpm add -D drizzle-kit tsx @types/bcrypt dotenv-cli
+pnpm add -D drizzle-kit tsx @types/bcrypt dotenv
 
+# === 7. 生成并执行迁移（TypeScript 方式）===
+echo "🔄 生成数据库迁移..."
 pnpm dlx drizzle-kit generate:pg
 
-cat > migrate.mjs << 'EOF'
+# 确保 tsconfig 支持 @/
+if [ ! -f tsconfig.json ]; then
+cat > tsconfig.json << 'EOF'
+{
+  "compilerOptions": {
+    "target": "ES2020",
+    "module": "commonjs",
+    "esModuleInterop": true,
+    "forceConsistentCasingInFileNames": true,
+    "strict": true,
+    "skipLibCheck": true,
+    "baseUrl": ".",
+    "paths": {
+      "@/*": ["./src/*"]
+    }
+  },
+  "include": ["src", "migrate.ts"]
+}
+EOF
+fi
+
+# 创建 migrate.ts
+cat > migrate.ts << 'EOF'
+import 'dotenv/config';
 import { migrate } from 'drizzle-orm/postgres-js/migrator';
-import { drizzle } from 'drizzle-orm/postgres-js';
-import postgres from 'postgres';
-import * as schema from './src/lib/db/schema.js';
-const client = postgres(process.env.DATABASE_URL, { prepare: false });
-const db = drizzle(client, { schema });
-await migrate(db, { migrationsFolder: './drizzle' });
-console.log('✅ 数据库迁移完成');
-process.exit(0);
+import { db } from '@/lib/db/client';
+
+async function main() {
+  await migrate(db, { migrationsFolder: './drizzle' });
+  console.log('✅ 数据库迁移完成');
+  process.exit(0);
+}
+main().catch((err) => {
+  console.error('❌ 迁移失败:', err);
+  process.exit(1);
+});
 EOF
 
-npx dotenv -e .env.local -- node migrate.mjs
+echo "▶️ 执行数据库迁移..."
+npx tsx migrate.ts
 
-# === 7. 启动服务 ===
+# === 8. 构建并启动 Web 服务 ===
+echo "🏗️  构建 Web 应用..."
 pnpm build
+
+# 停止旧进程（如果有）
+pkill -f "next start" 2>/dev/null || true
+
+echo "🚀 启动 Web 服务（端口 3000）..."
 nohup pnpm start > /root/ssr-web.log 2>&1 &
+
 sleep 5
 
+# === 9. 输出结果 ===
 IP=$(hostname -I | awk '{print $1}')
-echo -e "\n🎉 部署成功！\n🌐 访问: http://$IP:3000\n📄 日志: /root/ssr-web.log"
+echo ""
+echo "🎉 增量部署成功！"
+echo "🌐 Web 管理地址: http://$IP:3000"
+echo "📄 日志: /root/ssr-web.log"
+echo "🔐 DB: ssr_user / secure_password_123"
+echo ""
+echo "💡 提示："
+echo "   - 已保留所有用户数据和容器"
+echo "   - 可安全多次运行此脚本"

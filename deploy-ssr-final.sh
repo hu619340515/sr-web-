@@ -2,9 +2,9 @@
 
 set -e
 
-echo "🚀 开始 SSR 系统最终版一键部署（增量 + Drizzle v1+ 兼容）..."
+echo "🚀 开始 SSR 系统一键部署（最终版 · Drizzle v1+ 兼容 · 增量安全）..."
 
-# === 1. 安装基础依赖（仅缺失时安装）===
+# === 1. 安装基础依赖（仅当缺失时）===
 if ! command -v node &> /dev/null; then
   echo "🔧 安装 Node.js、Python、Docker、Git..."
   apt update
@@ -12,10 +12,12 @@ if ! command -v node &> /dev/null; then
     curl git wget python3 python3-pip build-essential \
     ca-certificates gnupg lsb-release software-properties-common
 
+  # Node.js 18
   curl -fsSL https://deb.nodesource.com/setup_18.x | bash -
   apt install -y nodejs
   npm install -g pnpm
 
+  # Docker
   install -m 0755 -d /etc/apt/keyrings
   curl -fsSL https://download.docker.com/linux/ubuntu/gpg | gpg --dearmor -o /etc/apt/keyrings/docker.gpg
   echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu $(lsb_release -cs) stable" | tee /etc/apt/sources.list.d/docker.list > /dev/null
@@ -28,7 +30,11 @@ fi
 
 # === 2. 部署 ShadowsocksR（增量）===
 cd /opt
-[ ! -d "shadowsocksr" ] && git clone -b akkariiin/master https://github.com/shadowsocksrr/shadowsocksr.git
+if [ ! -d "shadowsocksr" ]; then
+  git clone -b akkariiin/master https://github.com/shadowsocksrr/shadowsocksr.git
+else
+  echo "⚠️ /opt/shadowsocksr 已存在，跳过克隆"
+fi
 
 mkdir -p /etc/shadowsocks
 touch /etc/shadowsocks/config.json
@@ -54,10 +60,11 @@ systemctl daemon-reload
 systemctl enable shadowsocksr
 systemctl start shadowsocksr || true
 
-# === 3. 启动 PostgreSQL（保留数据）===
+# === 3. 启动 PostgreSQL（保留已有容器和数据）===
 if ! docker ps -a --format '{{.Names}}' | grep -q '^ssr-postgres$'; then
   echo "🆕 创建 PostgreSQL 容器..."
-  docker run -d --name ssr-postgres \
+  docker run -d \
+    --name ssr-postgres \
     -e POSTGRES_DB=ssr_management \
     -e POSTGRES_USER=ssr_user \
     -e POSTGRES_PASSWORD=secure_password_123 \
@@ -66,22 +73,43 @@ if ! docker ps -a --format '{{.Names}}' | grep -q '^ssr-postgres$'; then
     postgres:15
   sleep 15
 else
-  docker start ssr-postgres 2>/dev/null || true
-  echo "✅ PostgreSQL 已启动"
+  if ! docker ps --format '{{.Names}}' | grep -q '^ssr-postgres$'; then
+    echo "🔄 启动已存在的 PostgreSQL 容器..."
+    docker start ssr-postgres
+    sleep 5
+  else
+    echo "✅ PostgreSQL 已在运行"
+  fi
 fi
 
 # === 4. 部署 Web 项目 ===
 cd /root
-[ ! -d "sr-web-" ] && git clone https://github.com/hu619340515/sr-web-.git
+if [ ! -d "sr-web-" ]; then
+  git clone https://github.com/hu619340515/sr-web-.git
+else
+  echo "🔄 更新 sr-web- 代码..."
+  cd sr-web-
+  git pull origin main || echo "⚠️ Git pull 失败，使用当前代码"
+  cd ..
+fi
+
 cd sr-web-
 
-[ ! -f ".env.local" ] && echo "DATABASE_URL=postgresql://ssr_user:secure_password_123@localhost:5432/ssr_management" > .env.local
+# .env.local（如果不存在则创建）
+if [ ! -f ".env.local" ]; then
+  cat > .env.local << 'EOF'
+DATABASE_URL=postgresql://ssr_user:secure_password_123@localhost:5432/ssr_management
+EOF
+else
+  echo "✅ .env.local 已存在"
+fi
 
-# === 5. 注入核心代码 ===
+# === 5. 注入核心代码（含 Drizzle v1+ 正确配置）===
 mkdir -p src/lib/db
 
 cat > src/lib/db/schema.ts << 'EOF'
 import { pgTable, serial, text, timestamp, integer, boolean } from 'drizzle-orm/pg-core';
+
 export const users = pgTable('users', {
   id: serial('id').primaryKey(),
   username: text('username').notNull().unique(),
@@ -99,6 +127,7 @@ export const users = pgTable('users', {
   status: text('status').notNull(),
   createdAt: timestamp('created_at').defaultNow(),
 });
+
 export const scheduledTasks = pgTable('scheduled_tasks', {
   id: serial('id').primaryKey(),
   name: text('name').notNull(),
@@ -115,6 +144,7 @@ cat > src/lib/db/client.ts << 'EOF'
 import { drizzle } from 'drizzle-orm/postgres-js';
 import postgres from 'postgres';
 import * as schema from './schema';
+
 const client = postgres(process.env.DATABASE_URL!, { prepare: false });
 export const db = drizzle(client, { schema });
 EOF
@@ -129,54 +159,100 @@ import { promisify } from 'util';
 const execAsync = promisify(exec);
 
 async function updateSSRConfig() {
-  const allUsers = await db.select({ port: users.port, password: users.passwordHash, method: users.method, protocol: users.protocol, obfs: users.obfs }).from(users).where(eq(users.status, 'normal'));
-  const config = { server: "0.0.0.0", local_address: "127.0.0.1", local_port: 1080, port_password: Object.fromEntries(allUsers.map(u => [String(u.port), u.password])), timeout: 120, method: "aes-256-cfb", protocol: "origin", obfs: "plain", redirect: "", dns_ipv6: false, fast_open: false, workers: 1 };
+  const allUsers = await db.select({
+    port: users.port,
+    password: users.passwordHash,
+    method: users.method,
+    protocol: users.protocol,
+    obfs: users.obfs,
+  }).from(users).where(eq(users.status, 'normal'));
+
+  const config = {
+    server: "0.0.0.0",
+    local_address: "127.0.0.1",
+    local_port: 1080,
+    port_password: Object.fromEntries(allUsers.map(u => [String(u.port), u.password])),
+    timeout: 120,
+    method: "aes-256-cfb",
+    protocol: "origin",
+    obfs: "plain",
+    redirect: "",
+    dns_ipv6: false,
+    fast_open: false,
+    workers: 1
+  };
+
   await fs.writeFile('/etc/shadowsocks/config.json', JSON.stringify(config, null, 2));
-  try { await execAsync('systemctl restart shadowsocksr'); } catch (e) { console.warn('⚠️ SSR 重启失败'); }
+  try {
+    await execAsync('systemctl restart shadowsocksr');
+  } catch (e) {
+    console.warn('⚠️ SSR 重启失败');
+  }
 }
 
 export async function createUser(input) {
-  const userData = { username: input.username, email: input.email, passwordHash: input.password, port: input.port, method: input.method, protocol: input.protocol || 'origin', obfs: input.obfs || 'plain', protoparam: '', obfsparam: '', trafficLimit: input.trafficLimit, expiresAt: input.expiresAt, status: 'normal' };
+  const userData = {
+    username: input.username,
+    email: input.email,
+    passwordHash: input.password,
+    port: input.port,
+    method: input.method,
+    protocol: input.protocol || 'origin',
+    obfs: input.obfs || 'plain',
+    protoparam: '',
+    obfsparam: '',
+    trafficLimit: input.trafficLimit,
+    expiresAt: input.expiresAt,
+    status: 'normal',
+  };
   const result = await db.insert(users).values(userData).returning();
   await updateSSRConfig();
   return result[0];
 }
+
 export async function getUsers() { return await db.select().from(users).orderBy(users.id); }
 export async function getUserById(id) { const r = await db.select().from(users).where(eq(users.id, id)).limit(1); return r[0]; }
 export async function updateUser(id, data) { const r = await db.update(users).set(data).where(eq(users.id, id)).returning(); await updateSSRConfig(); return r[0] || null; }
 export async function deleteUser(id) { const r = await db.delete(users).where(eq(users.id, id)); await updateSSRConfig(); return r.count > 0; }
 export async function getUserByPort(port) { const r = await db.select().from(users).where(eq(users.port, port)).limit(1); return r[0]; }
+
 export async function markUserExpired() {
   const now = new Date();
-  const r = await db.update(users).set({ status: 'expired' }).where(sql`${users.expiresAt} <= ${now} AND ${users.status} = 'normal'`).returning({ id: users.id });
+  const r = await db.update(users)
+    .set({ status: 'expired' })
+    .where(sql`${users.expiresAt} <= ${now} AND ${users.status} = 'normal'`)
+    .returning({ id: users.id });
   await updateSSRConfig();
   return r.length;
 }
 EOF
 
+# ✅ 关键修复：Drizzle v1+ 正确配置
 cat > drizzle.config.ts << 'EOF'
 import type { Config } from 'drizzle-kit';
+
 export default {
   schema: './src/lib/db/schema.ts',
   out: './drizzle',
-  driver: 'pg',
+  dialect: 'postgresql',
   dbCredentials: {
-    connectionString: process.env.DATABASE_URL!,
+    url: process.env.DATABASE_URL!,
   },
 } satisfies Config;
 EOF
 
 # === 6. 安装依赖 ===
+echo "📦 安装依赖..."
 pnpm install
 pnpm add drizzle-orm pg postgres bcrypt
 pnpm add -D drizzle-kit tsx @types/bcrypt dotenv
 
-# === 7. 【关键】Drizzle v1+ 迁移（自动处理首次/增量）===
-echo "🔄 生成数据库迁移（Drizzle v1+）..."
+# === 7. 生成并执行数据库迁移（Drizzle v1+）===
+echo "🔄 生成数据库迁移..."
 
 mkdir -p drizzle
 
-# 首次部署？检查 meta/_journal.json
+# 检查是否首次部署
 if [ ! -f "drizzle/meta/_journal.json" ]; then
   echo "🆕 初始化迁移系统（首次部署）..."
   npx drizzle-kit generate
@@ -185,7 +261,7 @@ else
   npx drizzle-kit generate
 fi
 
-# 确保 tsconfig 支持路径别名
+# 确保 tsconfig 支持 @/ 路径别名
 cat > tsconfig.json << 'EOF'
 {
   "compilerOptions": {
@@ -225,11 +301,13 @@ echo "▶️ 执行迁移..."
 npx tsx migrate.ts
 
 # === 8. 构建并启动 Web 服务 ===
+echo "🏗️  构建 Web 应用..."
 pnpm build
 
 # 杀掉旧进程（避免端口冲突）
 pkill -f "next start" 2>/dev/null || true
 
+echo "🚀 启动 Web 服务（端口 3000）..."
 nohup pnpm start > /root/ssr-web.log 2>&1 &
 sleep 5
 
@@ -239,4 +317,6 @@ echo ""
 echo "🎉 部署成功！"
 echo "🌐 Web 管理地址: http://$IP:3000"
 echo "📄 日志文件: /root/ssr-web.log"
+echo "🔐 数据库: ssr_user / secure_password_123"
+echo ""
 echo "💡 提示：此脚本可安全重复运行，不会丢失用户数据！"

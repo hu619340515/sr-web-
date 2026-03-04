@@ -2,9 +2,9 @@
 
 set -e
 
-echo "🚀 开始部署 SSR 系统（ROOT 专用模式）..."
+echo "🚀 开始部署 SSR 系统（ROOT 模式 + 修复迁移错误）..."
 
-# === 1. 安装依赖 ===
+# === 1. 安装基础依赖 ===
 echo "🔧 安装 Node.js、Python、Docker、Git..."
 apt update
 DEBIAN_FRONTEND=noninteractive apt install -y \
@@ -18,7 +18,7 @@ apt install -y nodejs
 # pnpm
 npm install -g pnpm
 
-# Docker（root 可直接使用）
+# Docker
 install -m 0755 -d /etc/apt/keyrings
 curl -fsSL https://download.docker.com/linux/ubuntu/gpg | gpg --dearmor -o /etc/apt/keyrings/docker.gpg
 echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu $(lsb_release -cs) stable" | tee /etc/apt/sources.list.d/docker.list > /dev/null
@@ -218,44 +218,51 @@ export default {
 } satisfies Config;
 EOF
 
-# === 6. 安装依赖 & 迁移 ===
-echo "📦 安装依赖..."
+# === 6. 安装依赖 ===
+echo "📦 安装 Node.js 依赖..."
 pnpm install
 pnpm add drizzle-orm pg postgres bcrypt
-pnpm add -D drizzle-kit tsx @types/bcrypt
+pnpm add -D drizzle-kit tsx @types/bcrypt dotenv-cli
 
-echo "🔄 数据库迁移..."
+# === 7. 生成并执行数据库迁移（关键修复）===
+echo "🔄 生成迁移文件..."
 pnpm dlx drizzle-kit generate:pg
-mkdir -p drizzle
 
-# 执行迁移
-npx tsx -e "
+echo "💾 创建迁移执行脚本..."
+cat > migrate.mjs << 'EOF'
 import { migrate } from 'drizzle-orm/postgres-js/migrator';
 import { drizzle } from 'drizzle-orm/postgres-js';
 import postgres from 'postgres';
-import * as schema from './src/lib/db/schema';
-const client = postgres(process.env.DATABASE_URL!, { prepare: false });
-const db = drizzle(client, { schema });
-await migrate(db, { migrationsFolder: './drizzle' });
-console.log('✅ 迁移完成');
-process.exit(0);
-"
+import * as schema from './src/lib/db/schema.js';
 
-# === 7. 启动 Web 服务 ===
-echo "🏗️  构建并启动..."
+const client = postgres(process.env.DATABASE_URL, { prepare: false });
+const db = drizzle(client, { schema });
+
+await migrate(db, { migrationsFolder: './drizzle' });
+console.log('✅ 数据库迁移完成');
+process.exit(0);
+EOF
+
+echo "▶️ 执行迁移..."
+npx dotenv -e .env.local -- node migrate.mjs
+
+# === 8. 构建并启动 Web 服务 ===
+echo "🏗️  构建 Web 应用..."
 pnpm build
+
+echo "🚀 启动 Web 服务（端口 3000）..."
 nohup pnpm start > /root/ssr-web.log 2>&1 &
 
 sleep 5
 
-# === 8. 输出结果 ===
+# === 9. 输出结果 ===
 IP=$(hostname -I | awk '{print $1}')
 echo ""
-echo "🎉 部署成功（ROOT 模式）！"
-echo "🌐 访问地址: http://$IP:3000"
-echo "📄 日志: /root/ssr-web.log"
-echo "🔐 DB: ssr_user / secure_password_123"
+echo "🎉 部署成功！"
+echo "🌐 Web 管理地址: http://$IP:3000"
+echo "📄 日志文件: /root/ssr-web.log"
+echo "🔐 数据库: ssr_user / secure_password_123"
 echo ""
-echo "💡 提示："
-echo "   - 云服务器请开放安全组端口 3000 和 SSR 端口（如 10000-20000）"
-echo "   - 首次使用请注册用户，密码将用于 SSR 连接"
+echo "💡 注意："
+echo "   - 云服务器请在安全组开放 3000 和 SSR 端口（如 10000-20000）"
+echo "   - 首次使用请通过 Web 界面注册用户"

@@ -2,7 +2,7 @@
 
 set -e
 
-echo "🚀 开始 SSR 系统一键部署（最终版 v8 · 修复顶层 await + 绕过 Drizzle 迁移器）..."
+echo "🚀 开始 SSR 系统一键部署（最终版 v9 · 幂等部署 + 防重复建表）..."
 
 # === 1. 安装基础依赖 ===
 if ! command -v node &> /dev/null; then
@@ -75,12 +75,11 @@ cd /root
 [ ! -d "sr-web-" ] && git clone https://github.com/hu619340515/sr-web-.git
 cd sr-web-
 
-# 🔑 使用 postgres://
 cat > .env.local << 'EOF'
 DATABASE_URL=postgres://ssr_user:secure_password_123@localhost:5432/ssr_management
 EOF
 
-# === 5. 注入核心代码 ===
+# === 5. 注入核心代码（同前）===
 mkdir -p src/lib/db
 
 cat > src/lib/db/schema.ts << 'EOF'
@@ -179,37 +178,50 @@ pnpm install
 pnpm add drizzle-orm pg postgres bcrypt
 pnpm add -D drizzle-kit tsx @types/bcrypt dotenv
 
-# === 7. 【关键】生成并手动应用迁移 SQL（修复顶层 await）===
-echo "🔄 生成迁移 SQL..."
+# === 7. 【智能迁移】仅当表不存在时才执行建表 ===
+echo "🔍 检查数据库表是否存在..."
 
-mkdir -p drizzle
+TABLES_EXIST=false
+if docker exec ssr-postgres psql -U ssr_user -d ssr_management -tAc "SELECT EXISTS (SELECT FROM information_schema.tables WHERE table_name = 'users')" | grep -q "t"; then
+  if docker exec ssr-postgres psql -U ssr_user -d ssr_management -tAc "SELECT EXISTS (SELECT FROM information_schema.tables WHERE table_name = 'scheduled_tasks')" | grep -q "t"; then
+    TABLES_EXIST=true
+  fi
+fi
 
-# 强制生成一次（即使无变化，确保有文件）
-npx drizzle-kit generate
-
-# 查找迁移文件
-MIGRATION_FILE=$(find drizzle -name "*.sql" | sort | tail -n1)
-
-if [ -z "$MIGRATION_FILE" ]; then
-  echo "⚠️ 未找到迁移 SQL 文件"
+if [ "$TABLES_EXIST" = "true" ]; then
+  echo "✅ 数据库表已存在，跳过迁移"
 else
-  echo "📄 使用迁移文件: $MIGRATION_FILE"
+  echo "🔄 生成并应用迁移..."
 
-  # ✅ 修复：使用 IIFE 包裹 async/await
-  cat > apply-migration.ts << 'EOF'
-import { config } from 'dotenv';
+  # 清理旧迁移（确保干净）
+  rm -rf drizzle/*
+  mkdir -p drizzle
+
+  npx drizzle-kit generate
+
+  MIGRATION_FILE=$(find drizzle -name "*.sql" | sort | tail -n1)
+  if [ -n "$MIGRATION_FILE" ]; then
+    cat > apply-migration.ts << 'EOF'
+import { config } of 'dotenv';
 config({ path: '.env.local' });
 
 import postgres from 'postgres';
 import { readFile } from 'fs/promises';
 
-// 使用 IIFE 避免顶层 await
 (async () => {
   const sql = postgres(process.env.DATABASE_URL!);
   try {
     const migrationSql = await readFile(process.argv[2], 'utf8');
-    await sql.unsafe(migrationSql);
-    console.log('✅ 迁移 SQL 执行成功');
+    // 分割 SQL 语句（Drizzle 生成的是多条语句）
+    const statements = migrationSql
+      .split(';')
+      .map(s => s.trim())
+      .filter(s => s && !s.startsWith('--'));
+
+    for (const stmt of statements) {
+      await sql.unsafe(stmt);
+    }
+    console.log('✅ 迁移执行成功');
   } catch (err) {
     console.error('❌ 迁移失败:', err);
     process.exit(1);
@@ -219,8 +231,10 @@ import { readFile } from 'fs/promises';
 })();
 EOF
 
-  echo "▶️ 执行迁移 SQL..."
-  npx tsx apply-migration.ts "$MIGRATION_FILE"
+    npx tsx apply-migration.ts "$MIGRATION_FILE"
+  else
+    echo "⚠️ 未生成迁移文件"
+  fi
 fi
 
 # === 8. 构建并启动 Web 服务 ===
@@ -229,10 +243,9 @@ pkill -f "next start" 2>/dev/null || true
 nohup pnpm start > /root/ssr-web.log 2>&1 &
 sleep 5
 
-# === 9. 输出结果 ===
 IP=$(hostname -I | awk '{print $1}')
 echo ""
 echo "🎉 部署成功！"
 echo "🌐 Web 管理地址: http://$IP:3000"
 echo "📄 日志: /root/ssr-web.log"
-echo "💡 提示：此脚本可安全重复运行，不会丢失用户数据！"
+echo "💡 此脚本可安全重复运行，不会重复建表！"

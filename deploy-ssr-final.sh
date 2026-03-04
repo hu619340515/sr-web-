@@ -2,7 +2,7 @@
 
 set -e
 
-echo "🚀 开始 SSR 系统一键部署（最终版 v4 · 彻底修复 .env 加载链）..."
+echo "🚀 开始 SSR 系统一键部署（最终版 v5 · 修复 postgres:// 协议问题）..."
 
 # === 1. 安装基础依赖 ===
 if ! command -v node &> /dev/null; then
@@ -75,9 +75,9 @@ cd /root
 [ ! -d "sr-web-" ] && git clone https://github.com/hu619340515/sr-web-.git
 cd sr-web-
 
-# 强制写入 .env.local
+# 🔑【关键修复】使用 postgres:// 而非 postgresql://
 cat > .env.local << 'EOF'
-DATABASE_URL=postgresql://ssr_user:secure_password_123@localhost:5432/ssr_management
+DATABASE_URL=postgres://ssr_user:secure_password_123@localhost:5432/ssr_management
 EOF
 
 # === 5. 注入核心代码 ===
@@ -118,6 +118,8 @@ cat > src/lib/db/client.ts << 'EOF'
 import { drizzle } from 'drizzle-orm/postgres-js';
 import postgres from 'postgres';
 import * as schema from './schema';
+
+// 必须使用 postgres:// 协议
 const client = postgres(process.env.DATABASE_URL!, { prepare: false });
 export const db = drizzle(client, { schema });
 EOF
@@ -157,16 +159,20 @@ export async function markUserExpired() {
 }
 EOF
 
-# ✅【关键修复】drizzle.config.ts 显式加载 .env.local
+# ✅ drizzle.config.ts：显式加载 .env.local + 检查协议
 cat > drizzle.config.ts << 'EOF'
 import type { Config } from 'drizzle-kit';
 import { config } from 'dotenv';
 
-// 让 drizzle-kit CLI 也能读到 .env.local
 config({ path: '.env.local' });
 
 if (!process.env.DATABASE_URL) {
   throw new Error('❌ DATABASE_URL is missing in .env.local');
+}
+
+// 检查是否使用正确的协议
+if (!process.env.DATABASE_URL.startsWith('postgres://')) {
+  throw new Error('❌ DATABASE_URL must start with "postgres://", not "postgresql://"');
 }
 
 export default {
@@ -185,20 +191,16 @@ pnpm add drizzle-orm pg postgres bcrypt
 pnpm add -D drizzle-kit tsx @types/bcrypt dotenv
 
 # === 7. 生成并执行迁移 ===
-echo "🔄 生成数据库迁移（Drizzle v1+）..."
+echo "🔄 生成数据库迁移..."
 
 mkdir -p drizzle
 
-if [ ! -f "drizzle/meta/_journal.json" ]; then
-  echo "🆕 初始化迁移系统..."
-else
-  echo "🔄 增量迁移检测..."
-fi
+# 清理旧迁移（可选，确保干净）
+# rm -rf drizzle/*
 
-# 现在 drizzle-kit 能正确读取 DATABASE_URL
 npx drizzle-kit generate
 
-# tsconfig 支持路径别名
+# tsconfig 支持 @/ 路径
 cat > tsconfig.json << 'EOF'
 {
   "compilerOptions": {
@@ -217,13 +219,17 @@ cat > tsconfig.json << 'EOF'
 }
 EOF
 
-# migrate.ts 也显式加载 .env.local（双重保险）
+# migrate.ts：双重保险
 cat > migrate.ts << 'EOF'
 import { config } from 'dotenv';
 config({ path: '.env.local' });
 
 if (!process.env.DATABASE_URL) {
   throw new Error('❌ DATABASE_URL not found in .env.local');
+}
+
+if (!process.env.DATABASE_URL.startsWith('postgres://')) {
+  console.warn('⚠️ WARNING: DATABASE_URL should use "postgres://", not "postgresql://"');
 }
 
 console.log('🔌 连接数据库:', process.env.DATABASE_URL.replace(/:.*@/, ':***@'));

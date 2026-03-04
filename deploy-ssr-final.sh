@@ -2,7 +2,7 @@
 
 set -e
 
-echo "🚀 开始 SSR 系统一键部署（最终版 v9 · 幂等部署 + 防重复建表）..."
+echo "🚀 开始 SSR 系统一键部署（最终版 v10 · 修复 build.sh 缺失 + 智能迁移）..."
 
 # === 1. 安装基础依赖 ===
 if ! command -v node &> /dev/null; then
@@ -79,7 +79,23 @@ cat > .env.local << 'EOF'
 DATABASE_URL=postgres://ssr_user:secure_password_123@localhost:5432/ssr_management
 EOF
 
-# === 5. 注入核心代码（同前）===
+# === 5. 【关键修复】确保 package.json 使用标准构建命令 ===
+if [ -f "package.json" ]; then
+  # 备份原文件
+  cp package.json package.json.bak
+
+  # 强制设置正确的 scripts
+  jq '
+    .scripts.build = "next build" |
+    .scripts.dev //= "next dev" |
+    .scripts.start //= "next start"
+  ' package.json.bak > package.json
+  echo "✅ 修复 package.json 构建脚本（使用 next build）"
+else
+  echo "⚠️ package.json 不存在，跳过修复"
+fi
+
+# === 6. 注入核心代码 ===
 mkdir -p src/lib/db
 
 cat > src/lib/db/schema.ts << 'EOF'
@@ -173,12 +189,12 @@ export default {
 } satisfies Config;
 EOF
 
-# === 6. 安装依赖 ===
+# === 7. 安装依赖 ===
 pnpm install
-pnpm add drizzle-orm pg postgres bcrypt
-pnpm add -D drizzle-kit tsx @types/bcrypt dotenv
+pnpm add drizzle-orm pg postgres bcrypt next react react-dom
+pnpm add -D drizzle-kit tsx @types/bcrypt dotenv @types/node typescript
 
-# === 7. 【智能迁移】仅当表不存在时才执行建表 ===
+# === 8. 【智能迁移】仅当表不存在时执行 ===
 echo "🔍 检查数据库表是否存在..."
 
 TABLES_EXIST=false
@@ -193,7 +209,6 @@ if [ "$TABLES_EXIST" = "true" ]; then
 else
   echo "🔄 生成并应用迁移..."
 
-  # 清理旧迁移（确保干净）
   rm -rf drizzle/*
   mkdir -p drizzle
 
@@ -202,7 +217,7 @@ else
   MIGRATION_FILE=$(find drizzle -name "*.sql" | sort | tail -n1)
   if [ -n "$MIGRATION_FILE" ]; then
     cat > apply-migration.ts << 'EOF'
-import { config } of 'dotenv';
+import { config } from 'dotenv';
 config({ path: '.env.local' });
 
 import postgres from 'postgres';
@@ -212,7 +227,6 @@ import { readFile } from 'fs/promises';
   const sql = postgres(process.env.DATABASE_URL!);
   try {
     const migrationSql = await readFile(process.argv[2], 'utf8');
-    // 分割 SQL 语句（Drizzle 生成的是多条语句）
     const statements = migrationSql
       .split(';')
       .map(s => s.trim())
@@ -232,13 +246,14 @@ import { readFile } from 'fs/promises';
 EOF
 
     npx tsx apply-migration.ts "$MIGRATION_FILE"
-  else
-    echo "⚠️ 未生成迁移文件"
   fi
 fi
 
-# === 8. 构建并启动 Web 服务 ===
+# === 9. 构建并启动 ===
+echo "📦 构建 Next.js 应用..."
 pnpm build
+
+echo "▶️ 启动 Web 服务..."
 pkill -f "next start" 2>/dev/null || true
 nohup pnpm start > /root/ssr-web.log 2>&1 &
 sleep 5
@@ -248,4 +263,4 @@ echo ""
 echo "🎉 部署成功！"
 echo "🌐 Web 管理地址: http://$IP:3000"
 echo "📄 日志: /root/ssr-web.log"
-echo "💡 此脚本可安全重复运行，不会重复建表！"
+echo "💡 此脚本可安全重复运行！"

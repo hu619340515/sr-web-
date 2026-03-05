@@ -2,7 +2,7 @@
 
 set -e
 
-echo "🚀 开始 SSR 系统一键部署（v18 · 补全 scheduledTasks 的更新支持）..."
+echo "🚀 开始 SSR 系统一键部署（v19 · 补全 getScheduledTasks）..."
 
 # === 1. Node.js 20 ===
 CURRENT_NODE=$(node -v 2>/dev/null || echo "none")
@@ -128,7 +128,7 @@ const client = postgres(process.env.DATABASE_URL!, { prepare: false });
 export const db = drizzle(client, { schema });
 EOF
 
-# === 8. 【核心】storage.ts（完整 CRUD 支持）===
+# === 8. 【核心】storage.ts（完整 CRUD + 列表）===
 cat > src/lib/storage.ts << 'EOF'
 import { eq, sql } from 'drizzle-orm';
 import { db } from '@/lib/db/client';
@@ -224,6 +224,10 @@ export async function getServerStatus() {
 }
 
 // --- Scheduled Tasks ---
+export async function getScheduledTasks() {
+  return await db.select().from(scheduledTasks).orderBy(scheduledTasks.id);
+}
+
 export async function getScheduledTaskById(id: number) {
   const r = await db.select().from(scheduledTasks).where(eq(scheduledTasks.id, id)).limit(1);
   return r[0] || null;
@@ -245,13 +249,14 @@ export const storage = {
   checkExpiredUsers,
   markUserExpired,
   getServerStatus,
-  getScheduledTaskById,
-  updateScheduledTask,
+  getScheduledTasks,        // ✅ 复数：获取所有
+  getScheduledTaskById,     // ✅ 单数：按 ID 获取
+  updateScheduledTask,      // ✅ 更新
 };
 EOF
 
 # === 9. 修复 API 路由 ===
-mkdir -p src/app/api/check-expired src/app/api/server src/app/api/tasks/[id]
+mkdir -p src/app/api/check-expired src/app/api/server src/app/api/tasks src/app/api/tasks/[id]
 
 cat > src/app/api/check-expired/route.ts << 'EOF'
 import { NextResponse } from 'next/server';
@@ -291,6 +296,28 @@ export async function GET() {
     });
   } catch (error) {
     console.error('❌ 获取服务器状态失败:', error);
+    return NextResponse.json<ApiResponse>(
+      { success: false, message: '服务器内部错误' },
+      { status: 500 }
+    );
+  }
+}
+EOF
+
+cat > src/app/api/tasks/route.ts << 'EOF'
+import { NextResponse } from 'next/server';
+import { storage } from '@/lib/storage';
+import { ApiResponse } from '@/types';
+
+export async function GET() {
+  try {
+    const tasks = await storage.getScheduledTasks();
+    return NextResponse.json<ApiResponse>({
+      success: true,
+      data: tasks,
+    });
+  } catch (error) {
+    console.error('❌ 获取定时任务列表失败:', error);
     return NextResponse.json<ApiResponse>(
       { success: false, message: '服务器内部错误' },
       { status: 500 }
@@ -432,6 +459,6 @@ nohup pnpm start > /root/ssr-web.log 2>&1 &
 
 IP=$(hostname -I | awk '{print $1}')
 echo ""
-echo "🎉 部署成功！v18 · 所有 storage 方法已补全（含 scheduledTasks 更新）"
+echo "🎉 部署成功！v19 · 所有 storage 方法已补全（含 getScheduledTasks）"
 echo "🌐 管理地址: http://$IP:3000"
 echo "📄 日志: /root/ssr-web.log"

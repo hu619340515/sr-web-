@@ -2,7 +2,7 @@
 
 set -e
 
-echo "🚀 开始 SSR 管理系统一键部署（v24 · 完整最终版）..."
+echo "🚀 开始 SSR 管理系统一键部署（v25 · 完整最终版）..."
 
 # === 1. Node.js 20 ===
 CURRENT_NODE=$(node -v 2>/dev/null || echo "none")
@@ -91,7 +91,7 @@ if ! grep -q '"start"' package.json; then
   sed -i 's/"scripts": {/"scripts": {\n    "start": "next start",/g' package.json
 fi
 
-# === 7. 【核心】类型定义（v24 · 含 UpdateUserRequest + SSR_CONFIG）===
+# === 7. 【核心】类型定义（v25 · 含 UpdateUserRequest + SSR_CONFIG）===
 mkdir -p src/types
 
 cat > src/types/index.ts << 'EOF'
@@ -204,7 +204,7 @@ const client = postgres(process.env.DATABASE_URL!, { prepare: false });
 export const db = drizzle(client, { schema });
 EOF
 
-# === 9. 【核心】storage.ts（v24 · 类型安全 + bcrypt + 完整导出）===
+# === 9. 【核心】storage.ts（v25 · 类型安全 + bcrypt + 完整导出）===
 cat > src/lib/storage.ts << 'EOF'
 import { eq, sql } from 'drizzle-orm';
 import { db } from '@/lib/db/client';
@@ -390,8 +390,8 @@ export const storage = {
 };
 EOF
 
-# === 10. API 路由（含 [id]/route.ts 修复）===
-mkdir -p src/app/api/check-expired src/app/api/server src/app/api/tasks src/app/api/tasks/[id] src/app/api/traffic src/app/api/users src/app/api/users/[id]
+# === 10. API 路由（v25 · 修复 passwordHash 类型错误）===
+mkdir -p src/app/api/check-expired src/app/api/server src/app/api/tasks src/app/api/tasks/[id]/execute src/app/api/traffic src/app/api/users src/app/api/users/[id]
 
 # users/route.ts
 cat > src/app/api/users/route.ts << 'EOF'
@@ -431,11 +431,12 @@ export async function POST(request: Request) {
 }
 EOF
 
-# users/[id]/route.ts （v24 · 含 UpdateUserRequest）
+# users/[id]/route.ts （v25 · 关键修复：使用 updateFields）
 cat > src/app/api/users/[id]/route.ts << 'EOF'
 import { NextRequest, NextResponse } from 'next/server';
 import { storage } from '@/lib/storage';
 import { UpdateUserRequest, ApiResponse } from '@/types';
+import { users } from '@/lib/db/schema';
 
 export async function GET(
   request: NextRequest,
@@ -473,17 +474,28 @@ export async function PUT(
       return NextResponse.json<ApiResponse>({ success: false, message: '无效的用户 ID' }, { status: 400 });
     }
 
-    let updateData = { ...body };
+    const updateFields: Partial<typeof users.$inferInsert> = {};
+
+    if (body.username !== undefined) updateFields.username = body.username;
+    if (body.email !== undefined) updateFields.email = body.email;
+    if (body.port !== undefined) updateFields.port = body.port;
+    if (body.method !== undefined) updateFields.method = body.method;
+    if (body.protocol !== undefined) updateFields.protocol = body.protocol;
+    if (body.obfs !== undefined) updateFields.obfs = body.obfs;
+    if (body.trafficLimit !== undefined) updateFields.trafficLimit = body.trafficLimit;
+    if (body.trafficUsed !== undefined) updateFields.trafficUsed = body.trafficUsed;
+    if (body.status !== undefined) updateFields.status = body.status;
+
     if (body.password !== undefined) {
       const bcrypt = await import('bcrypt');
-      updateData.passwordHash = await bcrypt.hash(body.password, 12);
-      delete updateData.password;
-    }
-    if (body.expiresAt) {
-      updateData.expiresAt = new Date(body.expiresAt);
+      updateFields.passwordHash = await bcrypt.hash(body.password, 12);
     }
 
-    const updatedUser = await storage.updateUser(userId, updateData);
+    if (body.expiresAt !== undefined) {
+      updateFields.expiresAt = new Date(body.expiresAt);
+    }
+
+    const updatedUser = await storage.updateUser(userId, updateFields);
     if (!updatedUser) {
       return NextResponse.json<ApiResponse>({ success: false, message: '用户更新失败或不存在' }, { status: 404 });
     }
@@ -729,7 +741,7 @@ nohup pnpm start > /root/ssr-web.log 2>&1 &
 
 IP=$(hostname -I | awk '{print $1}')
 echo ""
-echo "🎉 SSR 管理系统部署成功！v24 · 完整最终版"
+echo "🎉 SSR 管理系统部署成功！v25 · 完整最终版"
 echo "🌐 访问地址: http://$IP:3000"
 echo "📄 日志文件: /root/ssr-web.log"
 echo "🔒 支持用户创建/更新/删除，密码自动哈希"

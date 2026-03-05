@@ -2,31 +2,37 @@
 
 set -e
 
-echo "🚀 开始 SSR 系统一键部署（最终版 v11 · 修复 build.sh + 无 jq 依赖）..."
+echo "🚀 开始 SSR 系统一键部署（最终版 v12 · Node.js 20 + 修复 build.sh + 幂等迁移）..."
 
-# === 1. 安装基础依赖（含 jq 可选，但这里不用）===
-if ! command -v node &> /dev/null; then
-  echo "🔧 安装 Node.js、Python、Docker、Git..."
+# === 1. 安装/升级 Node.js 到 v20 ===
+CURRENT_NODE=$(node -v 2>/dev/null || echo "none")
+if [[ "$CURRENT_NODE" == "v18"* ]] || [[ "$CURRENT_NODE" == "none" ]]; then
+  echo "🔧 升级 Node.js 到 v20.x (LTS)..."
   apt update
-  DEBIAN_FRONTEND=noninteractive apt install -y \
-    curl git wget python3 python3-pip build-essential \
-    ca-certificates gnupg lsb-release software-properties-common
-
-  curl -fsSL https://deb.nodesource.com/setup_18.x | bash -
+  apt install -y ca-certificates curl gnupg
+  mkdir -p /etc/apt/keyrings
+  curl -fsSL https://deb.nodesource.com/gpgkey/nodesource-repo.gpg.key | gpg --dearmor -o /etc/apt/keyrings/nodesource.gpg
+  echo "deb [signed-by=/etc/apt/keyrings/nodesource.gpg] https://deb.nodesource.com/node_20.x nodistro main" | tee /etc/apt/sources.list.d/nodesource.list
+  apt update
   apt install -y nodejs
   npm install -g pnpm
-
-  install -m 0755 -d /etc/apt/keyrings
-  curl -fsSL https://download.docker.com/linux/ubuntu/gpg | gpg --dearmor -o /etc/apt/keyrings/docker.gpg
-  echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu $(lsb_release -cs) stable" | tee /etc/apt/sources.list.d/docker.list > /dev/null
-  apt update
-  DEBIAN_FRONTEND=noninteractive apt install -y docker-ce docker-ce-cli containerd.io docker-compose-plugin
-  systemctl enable --now docker
+  echo "✅ Node.js $(node -v) 已安装"
 else
-  echo "✅ Node.js 已安装"
+  echo "✅ Node.js $CURRENT_NODE 已满足要求（>=20.9.0）"
 fi
 
-# === 2. 部署 ShadowsocksR ===
+# 验证版本
+if ! node -v | grep -E 'v2[0-9]+\.' > /dev/null; then
+  echo "❌ Node.js 版本仍低于 20，请检查安装"
+  exit 1
+fi
+
+# === 2. 安装其他基础依赖 ===
+DEBIAN_FRONTEND=noninteractive apt install -y \
+  git wget python3 python3-pip build-essential \
+  software-properties-common lsb-release
+
+# === 3. 部署 ShadowsocksR ===
 cd /opt
 [ ! -d "shadowsocksr" ] && git clone -b akkariiin/master https://github.com/shadowsocksrr/shadowsocksr.git
 
@@ -54,7 +60,17 @@ systemctl daemon-reload
 systemctl enable shadowsocksr
 systemctl start shadowsocksr || true
 
-# === 3. 启动 PostgreSQL ===
+# === 4. 启动 PostgreSQL ===
+if ! command -v docker &> /dev/null; then
+  echo "🐳 安装 Docker..."
+  install -m 0755 -d /etc/apt/keyrings
+  curl -fsSL https://download.docker.com/linux/ubuntu/gpg | gpg --dearmor -o /etc/apt/keyrings/docker.gpg
+  echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu $(lsb_release -cs) stable" | tee /etc/apt/sources.list.d/docker.list > /dev/null
+  apt update
+  DEBIAN_FRONTEND=noninteractive apt install -y docker-ce docker-ce-cli containerd.io docker-compose-plugin
+  systemctl enable --now docker
+fi
+
 if ! docker ps -a --format '{{.Names}}' | grep -q '^ssr-postgres$'; then
   echo "🆕 创建 PostgreSQL 容器..."
   docker run -d --name ssr-postgres \
@@ -70,7 +86,7 @@ else
   echo "✅ PostgreSQL 已启动"
 fi
 
-# === 4. 部署 Web 项目 ===
+# === 5. 部署 Web 项目 ===
 cd /root
 [ ! -d "sr-web-" ] && git clone https://github.com/hu619340515/sr-web-.git
 cd sr-web-
@@ -79,30 +95,19 @@ cat > .env.local << 'EOF'
 DATABASE_URL=postgres://ssr_user:secure_password_123@localhost:5432/ssr_management
 EOF
 
-# === 5. 【关键修复】重写 package.json 的 build 脚本（不依赖 jq）===
+# === 6. 【关键】修复 package.json build 脚本 ===
 if [ -f "package.json" ]; then
-  # 备份
   cp package.json package.json.bak
-
-  # 使用 sed 替换 build 脚本（支持单行或多行）
-  if grep -q '"build"' package.json; then
-    # 替换单行形式
-    sed -i 's|"build": *"[^"]*"|"build": "next build"|g' package.json
-    echo "✅ 修复 package.json: build → next build"
-  else
-    # 如果没有 build 脚本，手动插入（不太可能）
-    echo "⚠️ 未找到 build 脚本，跳过"
-  fi
-
+  # 替换 build 脚本为 next build
+  sed -i 's|"build": *"[^"]*"|"build": "next build"|g' package.json
   # 确保有 start 脚本
   if ! grep -q '"start"' package.json; then
     sed -i 's/"scripts": {/"scripts": {\n    "start": "next start",/g' package.json
   fi
-else
-  echo "⚠️ package.json 不存在"
+  echo "✅ 修复 package.json 构建命令"
 fi
 
-# === 6. 注入核心代码 ===
+# === 7. 注入核心代码 ===
 mkdir -p src/lib/db
 
 cat > src/lib/db/schema.ts << 'EOF'
@@ -196,12 +201,12 @@ export default {
 } satisfies Config;
 EOF
 
-# === 7. 安装依赖（确保 next 存在）===
+# === 8. 安装依赖 ===
 pnpm install
 pnpm add next react react-dom drizzle-orm pg postgres bcrypt
 pnpm add -D drizzle-kit tsx @types/bcrypt dotenv @types/node typescript
 
-# === 8. 智能迁移（仅当表不存在）===
+# === 9. 智能迁移（仅当表不存在）===
 echo "🔍 检查数据库表是否存在..."
 
 TABLES_EXIST=false
@@ -215,12 +220,9 @@ if [ "$TABLES_EXIST" = "true" ]; then
   echo "✅ 数据库表已存在，跳过迁移"
 else
   echo "🔄 生成并应用迁移..."
-
   rm -rf drizzle/*
   mkdir -p drizzle
-
   npx drizzle-kit generate
-
   MIGRATION_FILE=$(find drizzle -name "*.sql" | sort | tail -n1)
   if [ -n "$MIGRATION_FILE" ]; then
     cat > apply-migration.ts << 'EOF'
@@ -251,12 +253,11 @@ import { readFile } from 'fs/promises';
   }
 })();
 EOF
-
     npx tsx apply-migration.ts "$MIGRATION_FILE"
   fi
 fi
 
-# === 9. 构建并启动 ===
+# === 10. 构建并启动 ===
 echo "📦 构建 Next.js 应用..."
 pnpm build
 

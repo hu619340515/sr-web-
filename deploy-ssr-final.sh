@@ -2,7 +2,7 @@
 
 set -e
 
-echo "🚀 开始 SSR 管理系统一键部署（v25 · 完整最终版）..."
+echo "🚀 开始 SSR 管理系统一键部署（v25.1 · 完整最终版）..."
 
 # === 1. Node.js 20 ===
 CURRENT_NODE=$(node -v 2>/dev/null || echo "none")
@@ -91,7 +91,7 @@ if ! grep -q '"start"' package.json; then
   sed -i 's/"scripts": {/"scripts": {\n    "start": "next start",/g' package.json
 fi
 
-# === 7. 【核心】类型定义（v25 · 含 UpdateUserRequest + SSR_CONFIG）===
+# === 7. 【核心】类型定义（v25.1 · 含 ServerStatus + UpdateUserRequest + SSR_CONFIG）===
 mkdir -p src/types
 
 cat > src/types/index.ts << 'EOF'
@@ -140,6 +140,23 @@ export interface UpdateUserRequest {
   trafficUsed?: number;
   expiresAt?: string; // ISO 8601 字符串
   status?: 'normal' | 'expired' | 'disabled';
+}
+
+// 【v25.1 新增】服务器状态类型
+export interface ServerStatus {
+  uptime: number; // 秒
+  memory: {
+    total: number; // MB
+    used: number;
+    free: number;
+  };
+  cpuUsage: number; // 百分比整数，如 45
+  ssrRunning: boolean;
+  userStats: {
+    total: number;
+    expired: number;
+  };
+  timestamp: string; // ISO 8601
 }
 
 // SSR 配置常量（用于生成链接）
@@ -204,7 +221,7 @@ const client = postgres(process.env.DATABASE_URL!, { prepare: false });
 export const db = drizzle(client, { schema });
 EOF
 
-# === 9. 【核心】storage.ts（v25 · 类型安全 + bcrypt + 完整导出）===
+# === 9. 【核心】storage.ts（v25.1 · 类型安全 + bcrypt + 完整导出）===
 cat > src/lib/storage.ts << 'EOF'
 import { eq, sql } from 'drizzle-orm';
 import { db } from '@/lib/db/client';
@@ -390,7 +407,7 @@ export const storage = {
 };
 EOF
 
-# === 10. API 路由（v25 · 修复 passwordHash 类型错误）===
+# === 10. API 路由（v25.1 · 修复 passwordHash 和类型）===
 mkdir -p src/app/api/check-expired src/app/api/server src/app/api/tasks src/app/api/tasks/[id]/execute src/app/api/traffic src/app/api/users src/app/api/users/[id]
 
 # users/route.ts
@@ -431,7 +448,7 @@ export async function POST(request: Request) {
 }
 EOF
 
-# users/[id]/route.ts （v25 · 关键修复：使用 updateFields）
+# users/[id]/route.ts
 cat > src/app/api/users/[id]/route.ts << 'EOF'
 import { NextRequest, NextResponse } from 'next/server';
 import { storage } from '@/lib/storage';
@@ -741,8 +758,8 @@ nohup pnpm start > /root/ssr-web.log 2>&1 &
 
 IP=$(hostname -I | awk '{print $1}')
 echo ""
-echo "🎉 SSR 管理系统部署成功！v25 · 完整最终版"
+echo "🎉 SSR 管理系统部署成功！v25.1 · 完整最终版"
 echo "🌐 访问地址: http://$IP:3000"
 echo "📄 日志文件: /root/ssr-web.log"
-echo "🔒 支持用户创建/更新/删除，密码自动哈希"
 echo "✅ TypeScript 编译通过，Next.js 构建成功！"
+echo "🔒 支持用户管理、服务器状态、流量统计、定时任务"

@@ -2,11 +2,11 @@
 
 set -e
 
-echo "🚀 开始 SSR 管理系统一键部署（v25.5 · 修复 test/page.tsx 中 User 类型不匹配问题）..."
+echo "🚀 开始 SSR 管理系统一键部署（v25.6 · 修复 encodeURIComponent(null) 问题 + 全类型安全）..."
 
-# === 1~6. 复用之前的环境准备（Node.js, Docker, Git clone 等）===
+# === 1. 安装 Node.js 20（如未安装或版本 < 20）===
 CURRENT_NODE=$(node -v 2>/dev/null || echo "none")
-if [[ "$CURRENT_NODE" == "v18"* ]] || [[ "$CURRENT_NODE" == "none" ]]; then
+if [[ "$CURRENT_NODE" != "v20"* ]]; then
   apt update
   apt install -y ca-certificates curl gnupg
   mkdir -p /etc/apt/keyrings
@@ -17,8 +17,10 @@ if [[ "$CURRENT_NODE" == "v18"* ]] || [[ "$CURRENT_NODE" == "none" ]]; then
   npm install -g pnpm
 fi
 
+# === 2. 安装基础依赖 ===
 DEBIAN_FRONTEND=noninteractive apt install -y git wget python3 python3-pip build-essential software-properties-common lsb-release
 
+# === 3. 部署 ShadowsocksR 服务 ===
 cd /opt
 [ ! -d "shadowsocksr" ] && git clone -b akkariiin/master https://github.com/shadowsocksrr/shadowsocksr.git
 mkdir -p /etc/shadowsocks
@@ -45,6 +47,7 @@ systemctl daemon-reload
 systemctl enable shadowsocksr
 systemctl start shadowsocksr || true
 
+# === 4. 安装 Docker（用于 PostgreSQL）===
 if ! command -v docker &> /dev/null; then
   install -m 0755 -d /etc/apt/keyrings
   curl -fsSL https://download.docker.com/linux/ubuntu/gpg | gpg --dearmor -o /etc/apt/keyrings/docker.gpg
@@ -54,6 +57,7 @@ if ! command -v docker &> /dev/null; then
   systemctl enable --now docker
 fi
 
+# === 5. 启动 PostgreSQL 容器 ===
 if ! docker ps -a --format '{{.Names}}' | grep -q '^ssr-postgres$'; then
   docker run -d --name ssr-postgres \
     -e POSTGRES_DB=ssr_management \
@@ -67,28 +71,27 @@ else
   docker start ssr-postgres 2>/dev/null || true
 fi
 
+# === 6. 克隆前端项目 ===
 cd /root
 [ ! -d "sr-web-" ] && git clone https://github.com/hu619340515/sr-web-.git
 cd sr-web-
 
-cat > .env.local << 'EOF'
+# === 7. 配置 .env.local ===
+PUBLIC_IP=$(curl -s https://api.ipify.org || hostname -I | awk '{print $1}')
+cat > .env.local << EOF
 DATABASE_URL=postgres://ssr_user:secure_password_123@localhost:5432/ssr_management
-NEXT_PUBLIC_SERVER_HOST=localhost
+NEXT_PUBLIC_SERVER_HOST=$PUBLIC_IP
 EOF
 
-PUBLIC_IP=$(curl -s https://api.ipify.org || hostname -I | awk '{print $1}')
-sed -i "s/NEXT_PUBLIC_SERVER_HOST=localhost/NEXT_PUBLIC_SERVER_HOST=$PUBLIC_IP/" .env.local
-
+# === 8. 修复 package.json scripts（确保有 build/start）===
 sed -i 's|"build": *"[^"]*"|"build": "next build"|g' package.json || true
 if ! grep -q '"start"' package.json; then
   sed -i 's/"scripts": {/"scripts": {\n    "start": "next start",/g' package.json
 fi
 
-# === 7. 【关键】类型定义 —— 保持 v25.4 内容（含 ScheduledTask + 正确 User）===
+# === 9. 【核心】类型定义 src/types/index.ts ===
 mkdir -p src/types
-
 cat > src/types/index.ts << 'EOF'
-// 用户数据模型（来自数据库）
 export interface User {
   id: number;
   username: string;
@@ -98,16 +101,15 @@ export interface User {
   method: string;
   protocol: string | null;
   obfs: string | null;
-  protoparam: string | null;  // ← 注意拼写：小写 p
-  obfsparam: string | null;   // ← 小写 p
-  trafficLimit: number; // MB
-  trafficUsed: number;  // MB
+  protoparam: string | null;
+  obfsparam: string | null;
+  trafficLimit: number;
+  trafficUsed: number;
   expiresAt: Date | null;
   status: 'normal' | 'expired' | 'disabled';
   createdAt: Date | null;
 }
 
-// 创建用户请求体（必填字段）
 export interface CreateUserRequest {
   username: string;
   email: string;
@@ -117,10 +119,9 @@ export interface CreateUserRequest {
   protocol?: string | null;
   obfs?: string | null;
   trafficLimit: number;
-  expiresAt: string; // ISO 8601 字符串
+  expiresAt: string;
 }
 
-// 更新用户请求体（所有字段可选）
 export interface UpdateUserRequest {
   username?: string;
   email?: string;
@@ -135,7 +136,6 @@ export interface UpdateUserRequest {
   status?: 'normal' | 'expired' | 'disabled';
 }
 
-// 服务器状态
 export interface ServerStatus {
   uptime: number;
   memory: { total: number; used: number; free: number };
@@ -145,7 +145,6 @@ export interface ServerStatus {
   timestamp: string;
 }
 
-// 定时任务类型
 export interface ScheduledTask {
   id: number;
   name: string;
@@ -157,7 +156,6 @@ export interface ScheduledTask {
   createdAt: Date;
 }
 
-// SSR 配置常量
 export const SSR_CONFIG = {
   defaultMethod: 'aes-256-cfb',
   defaultProtocol: 'origin',
@@ -167,7 +165,6 @@ export const SSR_CONFIG = {
     : process.env.NEXT_PUBLIC_SERVER_HOST || '127.0.0.1',
 } as const;
 
-// 通用 API 响应
 export interface ApiResponse {
   success: boolean;
   message?: string;
@@ -176,9 +173,8 @@ export interface ApiResponse {
 }
 EOF
 
-# === 8. DB Schema（保持一致）===
+# === 10. DB Schema ===
 mkdir -p src/lib/db
-
 cat > src/lib/db/schema.ts << 'EOF'
 import { pgTable, serial, text, timestamp, integer, boolean } from 'drizzle-orm/pg-core';
 export const users = pgTable('users', {
@@ -219,7 +215,7 @@ const client = postgres(process.env.DATABASE_URL!, { prepare: false });
 export const db = drizzle(client, { schema });
 EOF
 
-# === 9. storage.ts（保持逻辑）===
+# === 11. storage.ts（含流量、状态、任务管理）===
 cat > src/lib/storage.ts << 'EOF'
 import { eq, sql } from 'drizzle-orm';
 import { db } from '@/lib/db/client';
@@ -400,7 +396,7 @@ export const storage = {
 };
 EOF
 
-# === 10~12. 修复 server/page.tsx + tasks/page.tsx（复用 v25.4）===
+# === 12. server/page.tsx ===
 mkdir -p src/app/server
 cat > src/app/server/page.tsx << 'EOF'
 "use client";
@@ -495,6 +491,7 @@ export default function ServerStatusPage() {
 }
 EOF
 
+# === 13. tasks/page.tsx ===
 mkdir -p src/app/tasks
 cat > src/app/tasks/page.tsx << 'EOF'
 "use client";
@@ -580,9 +577,8 @@ export default function TasksPage() {
 }
 EOF
 
-# === 13. 【关键修复】src/app/test/page.tsx —— 构造合法 User 对象 ===
+# === 14. 【v25.6 核心修复】src/app/test/page.tsx —— 安全处理 null 值 ===
 mkdir -p src/app/test
-
 cat > src/app/test/page.tsx << 'EOF'
 "use client";
 
@@ -591,63 +587,65 @@ import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Button } from "@/components/ui/button";
-import { Copy, LinkIcon } from "lucide-react";
+import { Copy } from "lucide-react";
 import { Navbar } from "@/components/navbar";
-import { User } from "@/types"; // ✅ 正确导入
+import { User } from "@/types";
 
-// 模拟 SSR 配置
 const testConfig = {
   server: "your-server-ip",
   serverPort: 443,
 };
 
-// ✅ 【v25.5 修复】构造完全符合 User 接口的测试对象
 const testUser: User = {
   id: 1,
   username: "testuser",
   email: "test@example.com",
-  passwordHash: "fake_hashed_password_123", // ← 不是 password
+  passwordHash: "fake_hashed_password_123",
   port: 10001,
   method: "aes-256-cfb",
   protocol: "auth_chain_a",
   obfs: "tls1.2_ticket_auth",
-  protoparam: "",   // ← 正确字段名（小写 p）
-  obfsparam: "",    // ← 正确字段名
-  trafficLimit: 102400, // 100 GB
+  protoparam: "",
+  obfsparam: "",
+  trafficLimit: 102400,
   trafficUsed: 0,
   expiresAt: new Date("2030-12-31"),
-  status: "normal", // ← 合法值
+  status: "normal",
   createdAt: new Date("2025-01-01"),
 };
 
-// 模拟生成 SSR 链接（简化版）
+// ✅ v25.6: 安全处理 null → ""
 function generateSSRLink(user: User, server: string, serverPort: number): string {
   const {
     port,
     passwordHash: password,
     method,
-    protocol = "origin",
-    obfs = "plain",
-    protoparam = "",
-    obfsparam = "",
+    protocol,
+    obfs,
+    protoparam,
+    obfsparam,
   } = user;
 
+  const safeProtocol = protocol ?? "origin";
+  const safeObfs = obfs ?? "plain";
+  const safeProtoparam = protoparam ?? "";
+  const safeObfsparam = obfsparam ?? "";
+
   const params = [
-    `obfs=${encodeURIComponent(obfs)}`,
-    `obfsparam=${encodeURIComponent(obfsparam)}`,
-    `protoparam=${encodeURIComponent(protoparam)}`,
-    `protocol=${encodeURIComponent(protocol)}`,
+    `obfs=${encodeURIComponent(safeObfs)}`,
+    `obfsparam=${encodeURIComponent(safeObfsparam)}`,
+    `protoparam=${encodeURIComponent(safeProtoparam)}`,
+    `protocol=${encodeURIComponent(safeProtocol)}`,
     `remarks=${encodeURIComponent(user.username)}`,
     `group=SSR_GROUP`,
   ].join('&');
 
   const link = `ssr://${btoa(
-    `${server}:${port}:${protocol}:${method}:${obfs}:${btoa(password)}?${params}`
+    `${server}:${port}:${safeProtocol}:${method}:${safeObfs}:${btoa(password)}?${params}`
   )}`;
   return link;
 }
 
-// 模拟复制
 async function copySSRLink(link: string): Promise<boolean> {
   try {
     await navigator.clipboard.writeText(link);
@@ -700,7 +698,7 @@ export default function TestPage() {
 }
 EOF
 
-# === 14. API 路由（简略）===
+# === 15. API 路由 ===
 mkdir -p src/app/api/server src/app/api/tasks
 cat > src/app/api/server/route.ts << 'EOF'
 import { NextResponse } from 'next/server';
@@ -741,7 +739,7 @@ export async function GET() {
 }
 EOF
 
-# === 15. Drizzle & 依赖 ===
+# === 16. Drizzle 配置 ===
 cat > drizzle.config.ts << 'EOF'
 import type { Config } from 'drizzle-kit';
 import { config } from 'dotenv';
@@ -758,10 +756,12 @@ export default {
 } satisfies Config;
 EOF
 
+# === 17. 安装依赖 ===
 pnpm install
 pnpm add next react react-dom drizzle-orm pg postgres bcrypt
 pnpm add -D drizzle-kit tsx @types/bcrypt dotenv @types/node typescript
 
+# === 18. 初始化数据库（如果表不存在）===
 TABLES_EXIST=false
 if docker exec ssr-postgres psql -U ssr_user -d ssr_management -tAc "SELECT EXISTS (SELECT FROM information_schema.tables WHERE table_name = 'users')" | grep -q "t"; then
   if docker exec ssr-postgres psql -U ssr_user -d ssr_management -tAc "SELECT EXISTS (SELECT FROM information_schema.tables WHERE table_name = 'scheduled_tasks')" | grep -q "t"; then
@@ -798,17 +798,19 @@ EOF
   fi
 fi
 
-# === 16. 构建启动 ===
+# === 19. 构建并启动 Next.js 应用 ===
 pnpm build
 pkill -f "next start" 2>/dev/null || true
 nohup pnpm start > /root/ssr-web.log 2>&1 &
 
 IP=$(hostname -I | awk '{print $1}')
 echo ""
-echo "🎉 SSR 管理系统部署成功！v25.5 · 修复 test/page.tsx 中 User 类型不匹配问题"
+echo "🎉 SSR 管理系统部署成功！v25.6"
+echo "✅ 修复内容："
+echo "   - ServerStatus.ssRunning → boolean"
+echo "   - ScheduledTask 类型导出"
+echo "   - testUser 完全符合 User 接口"
+echo "   - encodeURIComponent(null) → 使用 ?? 默认值（安全）"
+echo ""
 echo "🌐 访问地址: http://$IP:3000"
-echo "📄 日志文件: /root/ssr-web.log"
-echo "✅ 所有 TypeScript 错误已修复："
-echo "   - ServerStatus 使用 ssrRunning（boolean）"
-echo "   - ScheduledTask 类型已导出"
-echo "   - testUser 符合 User 接口（passwordHash, protoparam, obfsparam, status='normal'）"
+echo "📄 日志: /root/ssr-web.log"

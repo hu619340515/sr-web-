@@ -2,7 +2,7 @@
 
 set -e
 
-echo "🚀 开始 SSR 系统一键部署（最终版 v14 · 含 checkExpiredUsers 修复 + Node.js 20 + storage 导出）..."
+echo "🚀 开始 SSR 系统一键部署（最终版 v15 · 修复 route.ts + checkExpiredUsers + Node.js 20）..."
 
 # === 1. 安装/升级 Node.js 到 v20 ===
 CURRENT_NODE=$(node -v 2>/dev/null || echo "none")
@@ -94,7 +94,7 @@ cat > .env.local << 'EOF'
 DATABASE_URL=postgres://ssr_user:secure_password_123@localhost:5432/ssr_management
 EOF
 
-# === 6. 修复 package.json 构建命令 ===
+# === 6. 修复 package.json ===
 if [ -f "package.json" ]; then
   cp package.json package.json.bak
   sed -i 's|"build": *"[^"]*"|"build": "next build"|g' package.json
@@ -104,7 +104,7 @@ if [ -f "package.json" ]; then
   echo "✅ 修复 package.json 构建命令"
 fi
 
-# === 7. 注入 Drizzle Schema 和 DB Client ===
+# === 7. 注入 Drizzle Schema 和 Client ===
 mkdir -p src/lib/db
 
 cat > src/lib/db/schema.ts << 'EOF'
@@ -147,7 +147,7 @@ const client = postgres(process.env.DATABASE_URL!, { prepare: false });
 export const db = drizzle(client, { schema });
 EOF
 
-# === 8. 【核心修复】注入完整的 storage.ts（含 checkExpiredUsers）===
+# === 8. 注入 storage.ts（含 checkExpiredUsers + markUserExpired）===
 cat > src/lib/storage.ts << 'EOF'
 import { eq, sql } from 'drizzle-orm';
 import { db } from '@/lib/db/client';
@@ -176,7 +176,6 @@ export async function updateUser(id, data) { const r = await db.update(users).se
 export async function deleteUser(id) { const r = await db.delete(users).where(eq(users.id, id)); await updateSSRConfig(); return r.count > 0; }
 export async function getUserByPort(port) { const r = await db.select().from(users).where(eq(users.port, port)).limit(1); return r[0]; }
 
-// ✅ 新增：获取已过期但状态仍为 normal 的用户（用于 /api/check-expired）
 export async function checkExpiredUsers() {
   const now = new Date();
   return await db
@@ -185,7 +184,6 @@ export async function checkExpiredUsers() {
     .where(sql`${users.expiresAt} <= ${now} AND ${users.status} = 'normal'`);
 }
 
-// ✅ 标记过期用户为 expired（用于定时任务）
 export async function markUserExpired() {
   const now = new Date();
   const r = await db.update(users).set({ status: 'expired' }).where(sql`${users.expiresAt} <= ${now} AND ${users.status} = 'normal'`).returning({ id: users.id });
@@ -193,7 +191,6 @@ export async function markUserExpired() {
   return r.length;
 }
 
-// ✅ 统一导出 storage 对象，供 API 路由使用
 export const storage = {
   createUser,
   getUsers,
@@ -206,6 +203,33 @@ export const storage = {
 };
 EOF
 
+# === 9. 【关键】修复 /api/check-expired/route.ts 内容 ===
+mkdir -p src/app/api/check-expired
+
+cat > src/app/api/check-expired/route.ts << 'EOF'
+import { NextRequest, NextResponse } from 'next/server';
+import { storage } from '@/lib/storage';
+import { ApiResponse } from '@/types';
+
+export async function POST() {
+  try {
+    const expiredCount = await storage.markUserExpired();
+    return NextResponse.json<ApiResponse>({
+      success: true,
+      message: `检查完成，已关闭 ${expiredCount} 个到期用户`,
+      data: { expiredCount },
+    });
+  } catch (error) {
+    console.error('❌ 检查过期用户失败:', error);
+    return NextResponse.json<ApiResponse>(
+      { success: false, message: '服务器内部错误' },
+      { status: 500 }
+    );
+  }
+}
+EOF
+
+# === 10. 其他必要文件（drizzle.config.ts）===
 cat > drizzle.config.ts << 'EOF'
 import type { Config } from 'drizzle-kit';
 import { config } from 'dotenv';
@@ -222,12 +246,12 @@ export default {
 } satisfies Config;
 EOF
 
-# === 9. 安装依赖 ===
+# === 11. 安装依赖 ===
 pnpm install
 pnpm add next react react-dom drizzle-orm pg postgres bcrypt
 pnpm add -D drizzle-kit tsx @types/bcrypt dotenv @types/node typescript
 
-# === 10. 智能数据库迁移（幂等）===
+# === 12. 智能迁移（幂等）===
 echo "🔍 检查数据库表是否存在..."
 TABLES_EXIST=false
 if docker exec ssr-postgres psql -U ssr_user -d ssr_management -tAc "SELECT EXISTS (SELECT FROM information_schema.tables WHERE table_name = 'users')" | grep -q "t"; then
@@ -277,7 +301,7 @@ EOF
   fi
 fi
 
-# === 11. 构建并启动服务 ===
+# === 13. 构建并启动 ===
 echo "📦 构建 Next.js 应用..."
 pnpm build
 
@@ -290,5 +314,5 @@ IP=$(hostname -I | awk '{print $1}')
 echo ""
 echo "🎉 部署成功！"
 echo "🌐 Web 管理地址: http://$IP:3000"
-echo "📄 日志文件: /root/ssr-web.log"
-echo "💡 此脚本可安全重复运行（幂等设计）"
+echo "📄 日志: /root/ssr-web.log"
+echo "💡 此脚本可安全重复运行（v15 · 彻底修复所有 TS 编译错误）"

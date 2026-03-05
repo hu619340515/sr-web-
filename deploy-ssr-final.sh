@@ -2,7 +2,7 @@
 
 set -e
 
-echo "🚀 开始 SSR 管理系统一键部署（v25.1 · 完整最终版）..."
+echo "🚀 开始 SSR 管理系统一键部署（v25.2 · 修复 ServerStatus.status 错误）..."
 
 # === 1. Node.js 20 ===
 CURRENT_NODE=$(node -v 2>/dev/null || echo "none")
@@ -91,7 +91,7 @@ if ! grep -q '"start"' package.json; then
   sed -i 's/"scripts": {/"scripts": {\n    "start": "next start",/g' package.json
 fi
 
-# === 7. 【核心】类型定义（v25.1 · 含 ServerStatus + UpdateUserRequest + SSR_CONFIG）===
+# === 7. 【核心】类型定义（v25.2 · 仅含真实字段）===
 mkdir -p src/types
 
 cat > src/types/index.ts << 'EOF'
@@ -131,18 +131,18 @@ export interface CreateUserRequest {
 export interface UpdateUserRequest {
   username?: string;
   email?: string;
-  password?: string; // 若提供则重新哈希
+  password?: string;
   port?: number;
   method?: string;
   protocol?: string | null;
   obfs?: string | null;
   trafficLimit?: number;
   trafficUsed?: number;
-  expiresAt?: string; // ISO 8601 字符串
+  expiresAt?: string;
   status?: 'normal' | 'expired' | 'disabled';
 }
 
-// 【v25.1 新增】服务器状态类型
+// 【v25.2】服务器状态 —— 注意：没有 status 字段！只有 ssrRunning: boolean
 export interface ServerStatus {
   uptime: number; // 秒
   memory: {
@@ -151,7 +151,7 @@ export interface ServerStatus {
     free: number;
   };
   cpuUsage: number; // 百分比整数，如 45
-  ssrRunning: boolean;
+  ssrRunning: boolean; // ← 关键字段！不是字符串 status
   userStats: {
     total: number;
     expired: number;
@@ -159,7 +159,7 @@ export interface ServerStatus {
   timestamp: string; // ISO 8601
 }
 
-// SSR 配置常量（用于生成链接）
+// SSR 配置常量
 export const SSR_CONFIG = {
   defaultMethod: 'aes-256-cfb',
   defaultProtocol: 'origin',
@@ -221,7 +221,7 @@ const client = postgres(process.env.DATABASE_URL!, { prepare: false });
 export const db = drizzle(client, { schema });
 EOF
 
-# === 9. 【核心】storage.ts（v25.1 · 类型安全 + bcrypt + 完整导出）===
+# === 9. storage.ts（v25.2 · 返回 ssrRunning: boolean）===
 cat > src/lib/storage.ts << 'EOF'
 import { eq, sql } from 'drizzle-orm';
 import { db } from '@/lib/db/client';
@@ -344,7 +344,7 @@ export async function getServerStatus() {
     uptime,
     memory,
     cpuUsage,
-    ssrRunning,
+    ssrRunning, // ← 布尔值，不是字符串
     userStats: {
       total: Number(totalUsers[0]?.count || 0),
       expired: Number(expiredUsers[0]?.count || 0),
@@ -407,10 +407,139 @@ export const storage = {
 };
 EOF
 
-# === 10. API 路由（v25.1 · 修复 passwordHash 和类型）===
+# === 10. 【关键修复】自动修正 page.tsx 中的 status 引用 ===
+# 备份原文件
+cp src/app/page.tsx src/app/page.tsx.bak 2>/dev/null || true
+
+# 读取原内容，替换错误逻辑
+cat > src/app/page.tsx << 'EOF'
+"use client";
+
+import { useEffect, useState } from "react";
+import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
+import { Activity, Users, Calendar, HardDrive, TrendingUp } from "lucide-react";
+import { ServerStatus, User } from "@/types";
+import { Button } from "@/components/ui/button";
+import { Badge } from "@/components/ui/badge";
+import Link from "next/link";
+
+export default function DashboardPage() {
+  const [serverStatus, setServerStatus] = useState<ServerStatus | null>(null);
+  const [users, setUsers] = useState<User[]>([]);
+  const [loading, setLoading] = useState(true);
+
+  useEffect(() => {
+    const fetchData = async () => {
+      try {
+        const [statusRes, usersRes] = await Promise.all([
+          fetch("/api/server"),
+          fetch("/api/users"),
+        ]);
+        const statusData = await statusRes.json();
+        const usersData = await usersRes.json();
+        if (statusData.success) setServerStatus(statusData.data);
+        if (usersData.success) setUsers(usersData.data);
+      } catch (error) {
+        console.error("Failed to fetch data:", error);
+      } finally {
+        setLoading(false);
+      }
+    };
+    fetchData();
+  }, []);
+
+  if (loading) return <div className="flex items-center justify-center min-h-screen">加载中...</div>;
+
+  return (
+    <div className="container mx-auto py-8 space-y-8">
+      <h1 className="text-3xl font-bold">仪表盘</h1>
+
+      {/* Server Status */}
+      <Card>
+        <CardHeader className="flex flex-row items-center justify-between pb-2">
+          <div>
+            <CardTitle>服务器状态</CardTitle>
+            <CardDescription>实时监控 SSR 服务运行情况</CardDescription>
+          </div>
+          <HardDrive className="h-6 w-6 text-muted-foreground" />
+        </CardHeader>
+        <CardContent>
+          <div className="flex items-center gap-2">
+            {/* ✅ 修复点：使用 ssrRunning 而非 status */}
+            <Badge variant={serverStatus?.ssrRunning ? 'default' : 'destructive'}>
+              {serverStatus?.ssrRunning ? '运行中' : '已停止'}
+            </Badge>
+          </div>
+          <div className="mt-4 grid grid-cols-1 md:grid-cols-3 gap-4">
+            <div>
+              <p className="text-sm text-muted-foreground">CPU 使用率</p>
+              <p className="text-lg font-semibold">{serverStatus?.cpuUsage ?? 0}%</p>
+            </div>
+            <div>
+              <p className="text-sm text-muted-foreground">内存使用</p>
+              <p className="text-lg font-semibold">
+                {serverStatus?.memory.used ?? 0} / {serverStatus?.memory.total ?? 0} MB
+              </p>
+            </div>
+            <div>
+              <p className="text-sm text-muted-foreground">运行时间</p>
+              <p className="text-lg font-semibold">
+                {serverStatus ? Math.floor(serverStatus.uptime / 3600) : 0} 小时
+              </p>
+            </div>
+          </div>
+        </CardContent>
+      </Card>
+
+      {/* User Stats */}
+      <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
+        <Card>
+          <CardHeader className="flex flex-row items-center justify-between pb-2">
+            <CardTitle>总用户数</CardTitle>
+            <Users className="h-5 w-5 text-muted-foreground" />
+          </CardHeader>
+          <CardContent>
+            <p className="text-2xl font-bold">{serverStatus?.userStats.total ?? 0}</p>
+          </CardContent>
+        </Card>
+        <Card>
+          <CardHeader className="flex flex-row items-center justify-between pb-2">
+            <CardTitle>过期用户</CardTitle>
+            <Calendar className="h-5 w-5 text-muted-foreground" />
+          </CardHeader>
+          <CardContent>
+            <p className="text-2xl font-bold">{serverStatus?.userStats.expired ?? 0}</p>
+          </CardContent>
+        </Card>
+        <Card>
+          <CardHeader className="flex flex-row items-center justify-between pb-2">
+            <CardTitle>活跃连接</CardTitle>
+            <Activity className="h-5 w-5 text-muted-foreground" />
+          </CardHeader>
+          <CardContent>
+            <p className="text-2xl font-bold">-</p>
+            <p className="text-xs text-muted-foreground">暂未实现</p>
+          </CardContent>
+        </Card>
+      </div>
+
+      {/* Actions */}
+      <div className="flex gap-4">
+        <Button asChild>
+          <Link href="/users">管理用户</Link>
+        </Button>
+        <Button variant="outline" asChild>
+          <Link href="/tasks">定时任务</Link>
+        </Button>
+      </div>
+    </div>
+  );
+}
+EOF
+
+# === 11. 其他 API 路由（复用 v25.1 内容）===
 mkdir -p src/app/api/check-expired src/app/api/server src/app/api/tasks src/app/api/tasks/[id]/execute src/app/api/traffic src/app/api/users src/app/api/users/[id]
 
-# users/route.ts
 cat > src/app/api/users/route.ts << 'EOF'
 import { NextResponse } from 'next/server';
 import { storage } from '@/lib/storage';
@@ -448,7 +577,6 @@ export async function POST(request: Request) {
 }
 EOF
 
-# users/[id]/route.ts
 cat > src/app/api/users/[id]/route.ts << 'EOF'
 import { NextRequest, NextResponse } from 'next/server';
 import { storage } from '@/lib/storage';
@@ -548,7 +676,6 @@ export async function DELETE(
 }
 EOF
 
-# 其他路由（简化）
 cat > src/app/api/check-expired/route.ts << 'EOF'
 import { NextResponse } from 'next/server';
 import { storage } from '@/lib/storage';
@@ -692,7 +819,7 @@ export async function GET(request: Request) {
 }
 EOF
 
-# === 11. Drizzle Config ===
+# === 12. Drizzle Config ===
 cat > drizzle.config.ts << 'EOF'
 import type { Config } from 'drizzle-kit';
 import { config } from 'dotenv';
@@ -709,12 +836,12 @@ export default {
 } satisfies Config;
 EOF
 
-# === 12. 安装依赖 ===
+# === 13. 安装依赖 ===
 pnpm install
 pnpm add next react react-dom drizzle-orm pg postgres bcrypt
 pnpm add -D drizzle-kit tsx @types/bcrypt dotenv @types/node typescript
 
-# === 13. 幂等迁移 ===
+# === 14. 幂等迁移 ===
 TABLES_EXIST=false
 if docker exec ssr-postgres psql -U ssr_user -d ssr_management -tAc "SELECT EXISTS (SELECT FROM information_schema.tables WHERE table_name = 'users')" | grep -q "t"; then
   if docker exec ssr-postgres psql -U ssr_user -d ssr_management -tAc "SELECT EXISTS (SELECT FROM information_schema.tables WHERE table_name = 'scheduled_tasks')" | grep -q "t"; then
@@ -751,15 +878,15 @@ EOF
   fi
 fi
 
-# === 14. 构建启动 ===
+# === 15. 构建启动 ===
 pnpm build
 pkill -f "next start" 2>/dev/null || true
 nohup pnpm start > /root/ssr-web.log 2>&1 &
 
 IP=$(hostname -I | awk '{print $1}')
 echo ""
-echo "🎉 SSR 管理系统部署成功！v25.1 · 完整最终版"
+echo "🎉 SSR 管理系统部署成功！v25.2 · 修复 ServerStatus.status 错误"
 echo "🌐 访问地址: http://$IP:3000"
 echo "📄 日志文件: /root/ssr-web.log"
 echo "✅ TypeScript 编译通过，Next.js 构建成功！"
-echo "🔒 支持用户管理、服务器状态、流量统计、定时任务"
+echo "🔒 使用 ssrRunning: boolean 正确反映服务状态"

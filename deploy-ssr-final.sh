@@ -2,7 +2,7 @@
 
 set -e
 
-echo "🚀 开始 SSR 管理系统一键部署（v25.7 · 新增 TrafficStat 类型 + 全功能修复）..."
+echo "🚀 开始 SSR 管理系统一键部署（v25.8 · 修复 protocolParam 字段命名 + 全功能）..."
 
 # === 1. 安装 Node.js 20（如未安装或版本 < 20）===
 CURRENT_NODE=$(node -v 2>/dev/null || echo "none")
@@ -89,7 +89,7 @@ if ! grep -q '"start"' package.json; then
   sed -i 's/"scripts": {/"scripts": {\n    "start": "next start",/g' package.json
 fi
 
-# === 9. 【v25.7 核心】更新 src/types/index.ts —— 新增 TrafficStat ===
+# === 9. 【v25.8 核心】确保 types/index.ts 使用 protoparam / obfsparam（非驼峰）===
 mkdir -p src/types
 cat > src/types/index.ts << 'EOF'
 export interface User {
@@ -110,7 +110,6 @@ export interface User {
   createdAt: Date | null;
 }
 
-// ✅ v25.7: 新增 TrafficStat 类型
 export interface TrafficStat {
   id: number;
   username: string;
@@ -121,6 +120,7 @@ export interface TrafficStat {
   expiresAt: Date | null;
 }
 
+// ✅ 关键：字段名为 protoparam / obfsparam（全小写，SSR 标准）
 export interface CreateUserRequest {
   username: string;
   email: string;
@@ -129,6 +129,8 @@ export interface CreateUserRequest {
   method: string;
   protocol?: string | null;
   obfs?: string | null;
+  protoparam?: string | null;   // ← 不是 protocolParam
+  obfsparam?: string | null;    // ← 不是 obfsParam
   trafficLimit: number;
   expiresAt: string;
 }
@@ -141,6 +143,8 @@ export interface UpdateUserRequest {
   method?: string;
   protocol?: string | null;
   obfs?: string | null;
+  protoparam?: string | null;
+  obfsparam?: string | null;
   trafficLimit?: number;
   trafficUsed?: number;
   expiresAt?: string;
@@ -184,7 +188,7 @@ export interface ApiResponse {
 }
 EOF
 
-# === 10. DB Schema（保持不变）===
+# === 10. DB Schema（保持 protoparam / obfsparam）===
 mkdir -p src/lib/db
 cat > src/lib/db/schema.ts << 'EOF'
 import { pgTable, serial, text, timestamp, integer, boolean } from 'drizzle-orm/pg-core';
@@ -226,7 +230,7 @@ const client = postgres(process.env.DATABASE_URL!, { prepare: false });
 export const db = drizzle(client, { schema });
 EOF
 
-# === 11. storage.ts（保持 getTrafficStats 返回结构匹配 TrafficStat）===
+# === 11. storage.ts（保持一致）===
 cat > src/lib/storage.ts << 'EOF'
 import { eq, sql } from 'drizzle-orm';
 import { db } from '@/lib/db/client';
@@ -275,8 +279,8 @@ export async function createUser(input: CreateUserRequest) {
     method: input.method,
     protocol: input.protocol || 'origin',
     obfs: input.obfs || 'plain',
-    protoparam: '',
-    obfsparam: '',
+    protoparam: input.protoparam || '',
+    obfsparam: input.obfsparam || '',
     trafficLimit: input.trafficLimit,
     expiresAt,
     status: 'normal' as const,
@@ -355,7 +359,6 @@ export async function getServerStatus() {
   };
 }
 
-// ✅ 返回结构与 TrafficStat 一致
 export async function getTrafficStats(userId?: string) {
   let query = db.select({
     id: users.id,
@@ -408,7 +411,210 @@ export const storage = {
 };
 EOF
 
-# === 12. 【可选】创建 traffic/page.tsx 示例（确保使用 TrafficStat）===
+# === 12. 【v25.8 核心】修复 users/page.tsx：使用 protoparam / obfsparam ===
+mkdir -p src/app/users
+cat > src/app/users/page.tsx << 'EOF'
+"use client";
+
+import { useState } from "react";
+import { Button } from "@/components/ui/button";
+import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
+import { Input } from "@/components/ui/input";
+import { Label } from "@/components/ui/label";
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
+import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
+import { Plus, Trash2, Edit } from "lucide-react";
+import Link from "next/link";
+import { Navbar } from "@/components/navbar";
+import { CreateUserRequest } from "@/types";
+
+// ✅ v25.8: 初始状态使用正确的字段名（protoparam / obfsparam）
+const initialFormState: CreateUserRequest = {
+  username: "",
+  email: "",
+  password: "",
+  port: 10000,
+  method: "aes-256-cfb",
+  protocol: "origin",
+  obfs: "plain",
+  protoparam: "",     // ← 修正：不是 protocolParam
+  obfsparam: "",      // ← 修正：不是 obfsParam
+  expiresAt: "",
+  trafficLimit: 10240,
+};
+
+export default function UsersPage() {
+  const [users, setUsers] = useState<any[]>([]);
+  const [form, setForm] = useState<CreateUserRequest>(initialFormState);
+  const [loading, setLoading] = useState(false);
+
+  const handleInputChange = (e: React.ChangeEvent<HTMLInputElement | HTMLSelectElement>) => {
+    const { name, value } = e.target;
+    setForm(prev => ({ ...prev, [name]: value }));
+  };
+
+  const handleSubmit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setLoading(true);
+    try {
+      const res = await fetch("/api/users", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(form),
+      });
+      const data = await res.json();
+      if (data.success) {
+        alert("用户创建成功！");
+        setForm(initialFormState);
+        // 可在此处刷新列表
+      } else {
+        alert("创建失败: " + (data.message || "未知错误"));
+      }
+    } catch (err) {
+      console.error(err);
+      alert("请求失败");
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  return (
+    <div className="min-h-screen bg-background">
+      <Navbar />
+      <div className="container mx-auto py-8">
+        <div className="flex justify-between items-center mb-6">
+          <h1 className="text-2xl font-bold">用户管理</h1>
+          <Button asChild>
+            <Link href="/users/new">
+              <Plus className="mr-2 h-4 w-4" /> 新建用户
+            </Link>
+          </Button>
+        </div>
+
+        {/* 创建用户表单 */}
+        <Card className="mb-8">
+          <CardHeader>
+            <CardTitle>创建新用户</CardTitle>
+          </CardHeader>
+          <CardContent>
+            <form onSubmit={handleSubmit} className="grid grid-cols-1 md:grid-cols-2 gap-4">
+              <div>
+                <Label>用户名</Label>
+                <Input name="username" value={form.username} onChange={handleInputChange} required />
+              </div>
+              <div>
+                <Label>邮箱</Label>
+                <Input name="email" type="email" value={form.email} onChange={handleInputChange} required />
+              </div>
+              <div>
+                <Label>密码</Label>
+                <Input name="password" type="password" value={form.password} onChange={handleInputChange} required />
+              </div>
+              <div>
+                <Label>端口</Label>
+                <Input name="port" type="number" value={form.port} onChange={handleInputChange} required />
+              </div>
+              <div>
+                <Label>加密方式</Label>
+                <Select name="method" value={form.method} onValueChange={(v) => setForm(prev => ({ ...prev, method: v }))}>
+                  <SelectTrigger>
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="aes-256-cfb">aes-256-cfb</SelectItem>
+                    <SelectItem value="chacha20-ietf">chacha20-ietf</SelectItem>
+                  </SelectContent>
+                </Select>
+              </div>
+              <div>
+                <Label>协议</Label>
+                <Select name="protocol" value={form.protocol || "origin"} onValueChange={(v) => setForm(prev => ({ ...prev, protocol: v }))}>
+                  <SelectTrigger>
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="origin">origin</SelectItem>
+                    <SelectItem value="auth_chain_a">auth_chain_a</SelectItem>
+                  </SelectContent>
+                </Select>
+              </div>
+              <div>
+                <Label>混淆</Label>
+                <Select name="obfs" value={form.obfs || "plain"} onValueChange={(v) => setForm(prev => ({ ...prev, obfs: v }))}>
+                  <SelectTrigger>
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="plain">plain</SelectItem>
+                    <SelectItem value="tls1.2_ticket_auth">tls1.2_ticket_auth</SelectItem>
+                  </SelectContent>
+                </Select>
+              </div>
+              <div>
+                <Label>协议参数 (protoparam)</Label>
+                <Input name="protoparam" value={form.protoparam || ""} onChange={handleInputChange} placeholder="可选" />
+              </div>
+              <div>
+                <Label>混淆参数 (obfsparam)</Label>
+                <Input name="obfsparam" value={form.obfsparam || ""} onChange={handleInputChange} placeholder="可选" />
+              </div>
+              <div>
+                <Label>流量限制 (MB)</Label>
+                <Input name="trafficLimit" type="number" value={form.trafficLimit} onChange={handleInputChange} required />
+              </div>
+              <div>
+                <Label>过期时间</Label>
+                <Input name="expiresAt" type="date" value={form.expiresAt} onChange={handleInputChange} required />
+              </div>
+              <div className="md:col-span-2">
+                <Button type="submit" disabled={loading}>
+                  {loading ? "创建中..." : "创建用户"}
+                </Button>
+              </div>
+            </form>
+          </CardContent>
+        </Card>
+
+        {/* 用户列表（简化版） */}
+        <Card>
+          <CardHeader>
+            <CardTitle>用户列表</CardTitle>
+          </CardHeader>
+          <CardContent>
+            <Table>
+              <TableHeader>
+                <TableRow>
+                  <TableHead>ID</TableHead>
+                  <TableHead>用户名</TableHead>
+                  <TableHead>端口</TableHead>
+                  <TableHead>操作</TableHead>
+                </TableRow>
+              </TableHeader>
+              <TableBody>
+                {users.map(user => (
+                  <TableRow key={user.id}>
+                    <TableCell>{user.id}</TableCell>
+                    <TableCell>{user.username}</TableCell>
+                    <TableCell>{user.port}</TableCell>
+                    <TableCell>
+                      <Button variant="ghost" size="sm"><Edit className="h-4 w-4" /></Button>
+                      <Button variant="ghost" size="sm" className="text-red-500"><Trash2 className="h-4 w-4" /></Button>
+                    </TableCell>
+                  </TableRow>
+                ))}
+              </TableBody>
+            </Table>
+          </CardContent>
+        </Card>
+      </div>
+    </div>
+  );
+}
+EOF
+
+# === 13. 保留其他页面（traffic, server, tasks, test）===
+
+# --- traffic/page.tsx ---
 mkdir -p src/app/traffic
 cat > src/app/traffic/page.tsx << 'EOF'
 "use client";
@@ -511,25 +717,6 @@ export default function TrafficPage() {
 }
 EOF
 
-# === 13. API 路由：/api/traffic ===
-mkdir -p src/app/api/traffic
-cat > src/app/api/traffic/route.ts << 'EOF'
-import { NextResponse } from 'next/server';
-import { storage } from '@/lib/storage';
-import { ApiResponse } from '@/types';
-
-export async function GET() {
-  try {
-    const stats = await storage.getTrafficStats();
-    return NextResponse.json<ApiResponse>({ success: true, data: stats });
-  } catch (error) {
-    console.error('❌ 获取流量数据失败:', error);
-    return NextResponse.json<ApiResponse>({ success: false, message: '服务器内部错误' }, { status: 500 });
-  }
-}
-EOF
-
-# === 14. 其他页面（server, tasks, test）保持 v25.6 修复 ===
 # --- server/page.tsx ---
 mkdir -p src/app/server
 cat > src/app/server/page.tsx << 'EOF'
@@ -711,7 +898,7 @@ export default function TasksPage() {
 }
 EOF
 
-# --- test/page.tsx (v25.6 修复版) ---
+# --- test/page.tsx (v25.6+ 修复版) ---
 mkdir -p src/app/test
 cat > src/app/test/page.tsx << 'EOF'
 "use client";
@@ -748,7 +935,6 @@ const testUser: User = {
   createdAt: new Date("2025-01-01"),
 };
 
-// ✅ v25.6: 安全处理 null → ""
 function generateSSRLink(user: User, server: string, serverPort: number): string {
   const {
     port,
@@ -832,8 +1018,48 @@ export default function TestPage() {
 }
 EOF
 
-# === 15. API 路由：server & tasks ===
-mkdir -p src/app/api/server src/app/api/tasks
+# === 14. API 路由 ===
+mkdir -p src/app/api/users src/app/api/traffic src/app/api/server src/app/api/tasks
+
+# users API
+cat > src/app/api/users/route.ts << 'EOF'
+import { NextResponse } from 'next/server';
+import { storage } from '@/lib/storage';
+import { ApiResponse } from '@/types';
+
+export async function POST(request: Request) {
+  try {
+    const body = await request.json();
+    const user = await storage.createUser(body);
+    return NextResponse.json<ApiResponse>({ success: true, data: user });
+  } catch (error: any) {
+    console.error('❌ 创建用户失败:', error);
+    return NextResponse.json<ApiResponse>(
+      { success: false, message: error.message || '服务器内部错误' },
+      { status: 500 }
+    );
+  }
+}
+EOF
+
+# traffic API
+cat > src/app/api/traffic/route.ts << 'EOF'
+import { NextResponse } from 'next/server';
+import { storage } from '@/lib/storage';
+import { ApiResponse } from '@/types';
+
+export async function GET() {
+  try {
+    const stats = await storage.getTrafficStats();
+    return NextResponse.json<ApiResponse>({ success: true, data: stats });
+  } catch (error) {
+    console.error('❌ 获取流量数据失败:', error);
+    return NextResponse.json<ApiResponse>({ success: false, message: '服务器内部错误' }, { status: 500 });
+  }
+}
+EOF
+
+# server API
 cat > src/app/api/server/route.ts << 'EOF'
 import { NextResponse } from 'next/server';
 import { storage } from '@/lib/storage';
@@ -857,6 +1083,7 @@ export async function GET() {
 }
 EOF
 
+# tasks API
 cat > src/app/api/tasks/route.ts << 'EOF'
 import { NextResponse } from 'next/server';
 import { storage } from '@/lib/storage';
@@ -873,7 +1100,7 @@ export async function GET() {
 }
 EOF
 
-# === 16. Drizzle 配置 ===
+# === 15. Drizzle 配置 ===
 cat > drizzle.config.ts << 'EOF'
 import type { Config } from 'drizzle-kit';
 import { config } from 'dotenv';
@@ -890,12 +1117,12 @@ export default {
 } satisfies Config;
 EOF
 
-# === 17. 安装依赖 ===
+# === 16. 安装依赖 ===
 pnpm install
 pnpm add next react react-dom drizzle-orm pg postgres bcrypt recharts lucide-react
 pnpm add -D drizzle-kit tsx @types/bcrypt dotenv @types/node typescript
 
-# === 18. 初始化数据库（如果表不存在）===
+# === 17. 初始化数据库（如果表不存在）===
 TABLES_EXIST=false
 if docker exec ssr-postgres psql -U ssr_user -d ssr_management -tAc "SELECT EXISTS (SELECT FROM information_schema.tables WHERE table_name = 'users')" | grep -q "t"; then
   if docker exec ssr-postgres psql -U ssr_user -d ssr_management -tAc "SELECT EXISTS (SELECT FROM information_schema.tables WHERE table_name = 'scheduled_tasks')" | grep -q "t"; then
@@ -932,18 +1159,18 @@ EOF
   fi
 fi
 
-# === 19. 构建并启动 ===
+# === 18. 构建并启动 ===
 pnpm build
 pkill -f "next start" 2>/dev/null || true
 nohup pnpm start > /root/ssr-web.log 2>&1 &
 
 IP=$(hostname -I | awk '{print $1}')
 echo ""
-echo "🎉 SSR 管理系统部署成功！v25.7"
+echo "🎉 SSR 管理系统部署成功！v25.8"
 echo "✅ 本次修复："
-echo "   - 新增 TrafficStat 类型，解决编译错误"
-echo "   - 保留所有 v25.6 修复（null 安全、类型对齐等）"
-echo "   - 流量页面 /traffic 可正常访问"
+echo "   - 修正字段名：protoparam / obfsparam（非驼峰）"
+echo "   - 解决 'protocolParam does not exist' 编译错误"
+echo "   - 保留所有历史修复（TrafficStat、null 安全、类型对齐等）"
 echo ""
 echo "🌐 访问地址: http://$IP:3000"
 echo "📄 日志: /root/ssr-web.log"

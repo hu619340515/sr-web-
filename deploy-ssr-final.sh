@@ -2,9 +2,9 @@
 
 set -e
 
-echo "🚀 开始 SSR 系统一键部署（最终版 v10 · 修复 build.sh 缺失 + 智能迁移）..."
+echo "🚀 开始 SSR 系统一键部署（最终版 v11 · 修复 build.sh + 无 jq 依赖）..."
 
-# === 1. 安装基础依赖 ===
+# === 1. 安装基础依赖（含 jq 可选，但这里不用）===
 if ! command -v node &> /dev/null; then
   echo "🔧 安装 Node.js、Python、Docker、Git..."
   apt update
@@ -79,20 +79,27 @@ cat > .env.local << 'EOF'
 DATABASE_URL=postgres://ssr_user:secure_password_123@localhost:5432/ssr_management
 EOF
 
-# === 5. 【关键修复】确保 package.json 使用标准构建命令 ===
+# === 5. 【关键修复】重写 package.json 的 build 脚本（不依赖 jq）===
 if [ -f "package.json" ]; then
-  # 备份原文件
+  # 备份
   cp package.json package.json.bak
 
-  # 强制设置正确的 scripts
-  jq '
-    .scripts.build = "next build" |
-    .scripts.dev //= "next dev" |
-    .scripts.start //= "next start"
-  ' package.json.bak > package.json
-  echo "✅ 修复 package.json 构建脚本（使用 next build）"
+  # 使用 sed 替换 build 脚本（支持单行或多行）
+  if grep -q '"build"' package.json; then
+    # 替换单行形式
+    sed -i 's|"build": *"[^"]*"|"build": "next build"|g' package.json
+    echo "✅ 修复 package.json: build → next build"
+  else
+    # 如果没有 build 脚本，手动插入（不太可能）
+    echo "⚠️ 未找到 build 脚本，跳过"
+  fi
+
+  # 确保有 start 脚本
+  if ! grep -q '"start"' package.json; then
+    sed -i 's/"scripts": {/"scripts": {\n    "start": "next start",/g' package.json
+  fi
 else
-  echo "⚠️ package.json 不存在，跳过修复"
+  echo "⚠️ package.json 不存在"
 fi
 
 # === 6. 注入核心代码 ===
@@ -189,12 +196,12 @@ export default {
 } satisfies Config;
 EOF
 
-# === 7. 安装依赖 ===
+# === 7. 安装依赖（确保 next 存在）===
 pnpm install
-pnpm add drizzle-orm pg postgres bcrypt next react react-dom
+pnpm add next react react-dom drizzle-orm pg postgres bcrypt
 pnpm add -D drizzle-kit tsx @types/bcrypt dotenv @types/node typescript
 
-# === 8. 【智能迁移】仅当表不存在时执行 ===
+# === 8. 智能迁移（仅当表不存在）===
 echo "🔍 检查数据库表是否存在..."
 
 TABLES_EXIST=false

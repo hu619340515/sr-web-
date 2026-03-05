@@ -2,7 +2,7 @@
 
 set -e
 
-echo "🚀 开始 SSR 管理系统一键部署（v25.6 · 修复 encodeURIComponent(null) 问题 + 全类型安全）..."
+echo "🚀 开始 SSR 管理系统一键部署（v25.7 · 新增 TrafficStat 类型 + 全功能修复）..."
 
 # === 1. 安装 Node.js 20（如未安装或版本 < 20）===
 CURRENT_NODE=$(node -v 2>/dev/null || echo "none")
@@ -83,13 +83,13 @@ DATABASE_URL=postgres://ssr_user:secure_password_123@localhost:5432/ssr_manageme
 NEXT_PUBLIC_SERVER_HOST=$PUBLIC_IP
 EOF
 
-# === 8. 修复 package.json scripts（确保有 build/start）===
+# === 8. 修复 package.json scripts ===
 sed -i 's|"build": *"[^"]*"|"build": "next build"|g' package.json || true
 if ! grep -q '"start"' package.json; then
   sed -i 's/"scripts": {/"scripts": {\n    "start": "next start",/g' package.json
 fi
 
-# === 9. 【核心】类型定义 src/types/index.ts ===
+# === 9. 【v25.7 核心】更新 src/types/index.ts —— 新增 TrafficStat ===
 mkdir -p src/types
 cat > src/types/index.ts << 'EOF'
 export interface User {
@@ -108,6 +108,17 @@ export interface User {
   expiresAt: Date | null;
   status: 'normal' | 'expired' | 'disabled';
   createdAt: Date | null;
+}
+
+// ✅ v25.7: 新增 TrafficStat 类型
+export interface TrafficStat {
+  id: number;
+  username: string;
+  port: number;
+  trafficUsed: number; // MB
+  trafficLimit: number; // MB
+  status: 'normal' | 'expired' | 'disabled';
+  expiresAt: Date | null;
 }
 
 export interface CreateUserRequest {
@@ -173,7 +184,7 @@ export interface ApiResponse {
 }
 EOF
 
-# === 10. DB Schema ===
+# === 10. DB Schema（保持不变）===
 mkdir -p src/lib/db
 cat > src/lib/db/schema.ts << 'EOF'
 import { pgTable, serial, text, timestamp, integer, boolean } from 'drizzle-orm/pg-core';
@@ -215,7 +226,7 @@ const client = postgres(process.env.DATABASE_URL!, { prepare: false });
 export const db = drizzle(client, { schema });
 EOF
 
-# === 11. storage.ts（含流量、状态、任务管理）===
+# === 11. storage.ts（保持 getTrafficStats 返回结构匹配 TrafficStat）===
 cat > src/lib/storage.ts << 'EOF'
 import { eq, sql } from 'drizzle-orm';
 import { db } from '@/lib/db/client';
@@ -344,6 +355,7 @@ export async function getServerStatus() {
   };
 }
 
+// ✅ 返回结构与 TrafficStat 一致
 export async function getTrafficStats(userId?: string) {
   let query = db.select({
     id: users.id,
@@ -396,7 +408,129 @@ export const storage = {
 };
 EOF
 
-# === 12. server/page.tsx ===
+# === 12. 【可选】创建 traffic/page.tsx 示例（确保使用 TrafficStat）===
+mkdir -p src/app/traffic
+cat > src/app/traffic/page.tsx << 'EOF'
+"use client";
+
+import { useState, useEffect } from "react";
+import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
+import { TrafficStat } from "@/types";
+import { BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, Legend, ResponsiveContainer } from 'recharts';
+import { TrendingUp, Download } from "lucide-react";
+import Link from "next/link";
+import { Navbar } from "@/components/navbar";
+
+export default function TrafficPage() {
+  const [trafficData, setTrafficData] = useState<TrafficStat[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [selectedUser, setSelectedUser] = useState<string>("all");
+
+  useEffect(() => {
+    const fetchTraffic = async () => {
+      try {
+        const res = await fetch("/api/traffic");
+        const data = await res.json();
+        if (data.success) {
+          setTrafficData(data.data);
+        }
+      } catch (err) {
+        console.error(err);
+      } finally {
+        setLoading(false);
+      }
+    };
+    fetchTraffic();
+  }, []);
+
+  const filteredData = selectedUser === "all"
+    ? trafficData
+    : trafficData.filter(t => t.id.toString() === selectedUser);
+
+  const chartData = filteredData.map(t => ({
+    name: t.username,
+    used: t.trafficUsed,
+    limit: t.trafficLimit,
+  }));
+
+  if (loading) return <div className="p-8">加载中...</div>;
+
+  return (
+    <div className="min-h-screen bg-background">
+      <Navbar />
+      <div className="container mx-auto py-8">
+        <div className="flex justify-between items-center mb-6">
+          <h1 className="text-2xl font-bold">流量统计</h1>
+          <Link href="/users" className="text-sm text-blue-500 hover:underline">管理用户</Link>
+        </div>
+
+        <Card className="mb-6">
+          <CardHeader>
+            <CardTitle>筛选用户</CardTitle>
+          </CardHeader>
+          <CardContent>
+            <Select value={selectedUser} onValueChange={setSelectedUser}>
+              <SelectTrigger>
+                <SelectValue placeholder="选择用户" />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value="all">全部用户</SelectItem>
+                {trafficData.map(user => (
+                  <SelectItem key={user.id} value={user.id.toString()}>
+                    {user.username} (端口 {user.port})
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+          </CardContent>
+        </Card>
+
+        <Card>
+          <CardHeader>
+            <CardTitle>流量使用情况</CardTitle>
+            <CardDescription>单位：MB</CardDescription>
+          </CardHeader>
+          <CardContent>
+            <ResponsiveContainer width="10% min(100%, 800px)" height={300}>
+              <BarChart data={chartData}>
+                <CartesianGrid strokeDasharray="3 3" />
+                <XAxis dataKey="name" />
+                <YAxis />
+                <Tooltip />
+                <Legend />
+                <Bar dataKey="used" fill="#3b82f6" name="已用流量" />
+                <Bar dataKey="limit" fill="#ef4444" name="流量上限" />
+              </BarChart>
+            </ResponsiveContainer>
+          </CardContent>
+        </Card>
+      </div>
+    </div>
+  );
+}
+EOF
+
+# === 13. API 路由：/api/traffic ===
+mkdir -p src/app/api/traffic
+cat > src/app/api/traffic/route.ts << 'EOF'
+import { NextResponse } from 'next/server';
+import { storage } from '@/lib/storage';
+import { ApiResponse } from '@/types';
+
+export async function GET() {
+  try {
+    const stats = await storage.getTrafficStats();
+    return NextResponse.json<ApiResponse>({ success: true, data: stats });
+  } catch (error) {
+    console.error('❌ 获取流量数据失败:', error);
+    return NextResponse.json<ApiResponse>({ success: false, message: '服务器内部错误' }, { status: 500 });
+  }
+}
+EOF
+
+# === 14. 其他页面（server, tasks, test）保持 v25.6 修复 ===
+# --- server/page.tsx ---
 mkdir -p src/app/server
 cat > src/app/server/page.tsx << 'EOF'
 "use client";
@@ -491,7 +625,7 @@ export default function ServerStatusPage() {
 }
 EOF
 
-# === 13. tasks/page.tsx ===
+# --- tasks/page.tsx ---
 mkdir -p src/app/tasks
 cat > src/app/tasks/page.tsx << 'EOF'
 "use client";
@@ -577,7 +711,7 @@ export default function TasksPage() {
 }
 EOF
 
-# === 14. 【v25.6 核心修复】src/app/test/page.tsx —— 安全处理 null 值 ===
+# --- test/page.tsx (v25.6 修复版) ---
 mkdir -p src/app/test
 cat > src/app/test/page.tsx << 'EOF'
 "use client";
@@ -698,7 +832,7 @@ export default function TestPage() {
 }
 EOF
 
-# === 15. API 路由 ===
+# === 15. API 路由：server & tasks ===
 mkdir -p src/app/api/server src/app/api/tasks
 cat > src/app/api/server/route.ts << 'EOF'
 import { NextResponse } from 'next/server';
@@ -758,7 +892,7 @@ EOF
 
 # === 17. 安装依赖 ===
 pnpm install
-pnpm add next react react-dom drizzle-orm pg postgres bcrypt
+pnpm add next react react-dom drizzle-orm pg postgres bcrypt recharts lucide-react
 pnpm add -D drizzle-kit tsx @types/bcrypt dotenv @types/node typescript
 
 # === 18. 初始化数据库（如果表不存在）===
@@ -798,19 +932,18 @@ EOF
   fi
 fi
 
-# === 19. 构建并启动 Next.js 应用 ===
+# === 19. 构建并启动 ===
 pnpm build
 pkill -f "next start" 2>/dev/null || true
 nohup pnpm start > /root/ssr-web.log 2>&1 &
 
 IP=$(hostname -I | awk '{print $1}')
 echo ""
-echo "🎉 SSR 管理系统部署成功！v25.6"
-echo "✅ 修复内容："
-echo "   - ServerStatus.ssRunning → boolean"
-echo "   - ScheduledTask 类型导出"
-echo "   - testUser 完全符合 User 接口"
-echo "   - encodeURIComponent(null) → 使用 ?? 默认值（安全）"
+echo "🎉 SSR 管理系统部署成功！v25.7"
+echo "✅ 本次修复："
+echo "   - 新增 TrafficStat 类型，解决编译错误"
+echo "   - 保留所有 v25.6 修复（null 安全、类型对齐等）"
+echo "   - 流量页面 /traffic 可正常访问"
 echo ""
 echo "🌐 访问地址: http://$IP:3000"
 echo "📄 日志: /root/ssr-web.log"

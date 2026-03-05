@@ -2,7 +2,7 @@
 
 set -e
 
-echo "🚀 开始 SSR 系统一键部署（最终版 v12 · Node.js 20 + 修复 build.sh + 幂等迁移）..."
+echo "🚀 开始 SSR 系统一键部署（最终版 v13 · 修复 storage 导出 + Node.js 20）..."
 
 # === 1. 安装/升级 Node.js 到 v20 ===
 CURRENT_NODE=$(node -v 2>/dev/null || echo "none")
@@ -21,13 +21,12 @@ else
   echo "✅ Node.js $CURRENT_NODE 已满足要求（>=20.9.0）"
 fi
 
-# 验证版本
 if ! node -v | grep -E 'v2[0-9]+\.' > /dev/null; then
   echo "❌ Node.js 版本仍低于 20，请检查安装"
   exit 1
 fi
 
-# === 2. 安装其他基础依赖 ===
+# === 2. 安装其他依赖 ===
 DEBIAN_FRONTEND=noninteractive apt install -y \
   git wget python3 python3-pip build-essential \
   software-properties-common lsb-release
@@ -64,7 +63,7 @@ systemctl start shadowsocksr || true
 if ! command -v docker &> /dev/null; then
   echo "🐳 安装 Docker..."
   install -m 0755 -d /etc/apt/keyrings
-  curl -fsSL https://download.docker.com/linux/ubuntu/gpg | gpg --dearmor -o /etc/apt/keyrings/docker.gpg
+  curl -fsSL https https://download.docker.com/linux/ubuntu/gpg | gpg --dearmor -o /etc/apt/keyrings/docker.gpg
   echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu $(lsb_release -cs) stable" | tee /etc/apt/sources.list.d/docker.list > /dev/null
   apt update
   DEBIAN_FRONTEND=noninteractive apt install -y docker-ce docker-ce-cli containerd.io docker-compose-plugin
@@ -95,19 +94,17 @@ cat > .env.local << 'EOF'
 DATABASE_URL=postgres://ssr_user:secure_password_123@localhost:5432/ssr_management
 EOF
 
-# === 6. 【关键】修复 package.json build 脚本 ===
+# === 6. 修复 package.json ===
 if [ -f "package.json" ]; then
   cp package.json package.json.bak
-  # 替换 build 脚本为 next build
   sed -i 's|"build": *"[^"]*"|"build": "next build"|g' package.json
-  # 确保有 start 脚本
   if ! grep -q '"start"' package.json; then
     sed -i 's/"scripts": {/"scripts": {\n    "start": "next start",/g' package.json
   fi
   echo "✅ 修复 package.json 构建命令"
 fi
 
-# === 7. 注入核心代码 ===
+# === 7. 注入 schema 和 client ===
 mkdir -p src/lib/db
 
 cat > src/lib/db/schema.ts << 'EOF'
@@ -150,6 +147,7 @@ const client = postgres(process.env.DATABASE_URL!, { prepare: false });
 export const db = drizzle(client, { schema });
 EOF
 
+# === 8. 【关键修复】storage.ts 必须导出 storage 对象 ===
 cat > src/lib/storage.ts << 'EOF'
 import { eq, sql } from 'drizzle-orm';
 import { db } from '@/lib/db/client';
@@ -183,6 +181,17 @@ export async function markUserExpired() {
   await updateSSRConfig();
   return r.length;
 }
+
+// ✅ 关键：导出 storage 对象，供 API 路由使用
+export const storage = {
+  createUser,
+  getUsers,
+  getUserById,
+  updateUser,
+  deleteUser,
+  getUserByPort,
+  markUserExpired,
+};
 EOF
 
 cat > drizzle.config.ts << 'EOF'
@@ -201,14 +210,13 @@ export default {
 } satisfies Config;
 EOF
 
-# === 8. 安装依赖 ===
+# === 9. 安装依赖 ===
 pnpm install
 pnpm add next react react-dom drizzle-orm pg postgres bcrypt
 pnpm add -D drizzle-kit tsx @types/bcrypt dotenv @types/node typescript
 
-# === 9. 智能迁移（仅当表不存在）===
+# === 10. 智能迁移 ===
 echo "🔍 检查数据库表是否存在..."
-
 TABLES_EXIST=false
 if docker exec ssr-postgres psql -U ssr_user -d ssr_management -tAc "SELECT EXISTS (SELECT FROM information_schema.tables WHERE table_name = 'users')" | grep -q "t"; then
   if docker exec ssr-postgres psql -U ssr_user -d ssr_management -tAc "SELECT EXISTS (SELECT FROM information_schema.tables WHERE table_name = 'scheduled_tasks')" | grep -q "t"; then
@@ -257,7 +265,7 @@ EOF
   fi
 fi
 
-# === 10. 构建并启动 ===
+# === 11. 构建并启动 ===
 echo "📦 构建 Next.js 应用..."
 pnpm build
 

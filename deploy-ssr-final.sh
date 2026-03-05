@@ -2,7 +2,7 @@
 
 set -e
 
-echo "🚀 开始 SSR 管理系统一键部署（v23 · 最终完整版）..."
+echo "🚀 开始 SSR 管理系统一键部署（v24 · 完整最终版）..."
 
 # === 1. Node.js 20 ===
 CURRENT_NODE=$(node -v 2>/dev/null || echo "none")
@@ -75,13 +75,13 @@ cd /root
 [ ! -d "sr-web-" ] && git clone https://github.com/hu619340515/sr-web-.git
 cd sr-web-
 
-# 设置环境变量（含 NEXT_PUBLIC_*）
+# 设置环境变量
 cat > .env.local << 'EOF'
 DATABASE_URL=postgres://ssr_user:secure_password_123@localhost:5432/ssr_management
 NEXT_PUBLIC_SERVER_HOST=localhost
 EOF
 
-# 自动获取公网 IP 并更新（更智能）
+# 自动更新公网 IP
 PUBLIC_IP=$(curl -s https://api.ipify.org || hostname -I | awk '{print $1}')
 sed -i "s/NEXT_PUBLIC_SERVER_HOST=localhost/NEXT_PUBLIC_SERVER_HOST=$PUBLIC_IP/" .env.local
 
@@ -91,7 +91,7 @@ if ! grep -q '"start"' package.json; then
   sed -i 's/"scripts": {/"scripts": {\n    "start": "next start",/g' package.json
 fi
 
-# === 7. 【核心】类型定义（v23 · 含 SSR_CONFIG）===
+# === 7. 【核心】类型定义（v24 · 含 UpdateUserRequest + SSR_CONFIG）===
 mkdir -p src/types
 
 cat > src/types/index.ts << 'EOF'
@@ -114,7 +114,7 @@ export interface User {
   createdAt: Date | null;
 }
 
-// 创建用户请求体（前端提交）
+// 创建用户请求体（必填字段）
 export interface CreateUserRequest {
   username: string;
   email: string;
@@ -125,6 +125,21 @@ export interface CreateUserRequest {
   obfs?: string | null;
   trafficLimit: number;
   expiresAt: string; // ISO 8601 字符串
+}
+
+// 更新用户请求体（所有字段可选）
+export interface UpdateUserRequest {
+  username?: string;
+  email?: string;
+  password?: string; // 若提供则重新哈希
+  port?: number;
+  method?: string;
+  protocol?: string | null;
+  obfs?: string | null;
+  trafficLimit?: number;
+  trafficUsed?: number;
+  expiresAt?: string; // ISO 8601 字符串
+  status?: 'normal' | 'expired' | 'disabled';
 }
 
 // SSR 配置常量（用于生成链接）
@@ -189,7 +204,7 @@ const client = postgres(process.env.DATABASE_URL!, { prepare: false });
 export const db = drizzle(client, { schema });
 EOF
 
-# === 9. 【核心】storage.ts（v23 · 类型安全 + bcrypt + 完整导出）===
+# === 9. 【核心】storage.ts（v24 · 类型安全 + bcrypt + 完整导出）===
 cat > src/lib/storage.ts << 'EOF'
 import { eq, sql } from 'drizzle-orm';
 import { db } from '@/lib/db/client';
@@ -375,8 +390,8 @@ export const storage = {
 };
 EOF
 
-# === 10. API 路由（确保正确 await + 类型）===
-mkdir -p src/app/api/check-expired src/app/api/server src/app/api/tasks src/app/api/tasks/[id] src/app/api/traffic src/app/api/users
+# === 10. API 路由（含 [id]/route.ts 修复）===
+mkdir -p src/app/api/check-expired src/app/api/server src/app/api/tasks src/app/api/tasks/[id] src/app/api/traffic src/app/api/users src/app/api/users/[id]
 
 # users/route.ts
 cat > src/app/api/users/route.ts << 'EOF'
@@ -416,7 +431,95 @@ export async function POST(request: Request) {
 }
 EOF
 
-# 其他路由（简化，保持功能）
+# users/[id]/route.ts （v24 · 含 UpdateUserRequest）
+cat > src/app/api/users/[id]/route.ts << 'EOF'
+import { NextRequest, NextResponse } from 'next/server';
+import { storage } from '@/lib/storage';
+import { UpdateUserRequest, ApiResponse } from '@/types';
+
+export async function GET(
+  request: NextRequest,
+  { params }: { params: Promise<{ id: string }> }
+) {
+  try {
+    const { id } = await params;
+    const userId = parseInt(id, 10);
+    if (isNaN(userId)) {
+      return NextResponse.json<ApiResponse>({ success: false, message: '无效的用户 ID' }, { status: 400 });
+    }
+
+    const user = await storage.getUserById(userId);
+    if (!user) {
+      return NextResponse.json<ApiResponse>({ success: false, message: '用户不存在' }, { status: 404 });
+    }
+
+    return NextResponse.json<ApiResponse>({ success: true, data: user });
+  } catch (error) {
+    console.error('❌ 获取用户失败:', error);
+    return NextResponse.json<ApiResponse>({ success: false, message: '服务器内部错误' }, { status: 500 });
+  }
+}
+
+export async function PUT(
+  request: Request,
+  { params }: { params: Promise<{ id: string }> }
+) {
+  try {
+    const { id } = await params;
+    const body = await request.json() as UpdateUserRequest;
+    const userId = parseInt(id, 10);
+
+    if (isNaN(userId)) {
+      return NextResponse.json<ApiResponse>({ success: false, message: '无效的用户 ID' }, { status: 400 });
+    }
+
+    let updateData = { ...body };
+    if (body.password !== undefined) {
+      const bcrypt = await import('bcrypt');
+      updateData.passwordHash = await bcrypt.hash(body.password, 12);
+      delete updateData.password;
+    }
+    if (body.expiresAt) {
+      updateData.expiresAt = new Date(body.expiresAt);
+    }
+
+    const updatedUser = await storage.updateUser(userId, updateData);
+    if (!updatedUser) {
+      return NextResponse.json<ApiResponse>({ success: false, message: '用户更新失败或不存在' }, { status: 404 });
+    }
+
+    return NextResponse.json<ApiResponse>({ success: true, message: '用户更新成功', data: updatedUser });
+  } catch (error) {
+    console.error('❌ 更新用户失败:', error);
+    return NextResponse.json<ApiResponse>({ success: false, message: '服务器内部错误' }, { status: 500 });
+  }
+}
+
+export async function DELETE(
+  request: NextRequest,
+  { params }: { params: Promise<{ id: string }> }
+) {
+  try {
+    const { id } = await params;
+    const userId = parseInt(id, 10);
+    if (isNaN(userId)) {
+      return NextResponse.json<ApiResponse>({ success: false, message: '无效的用户 ID' }, { status: 400 });
+    }
+
+    const deleted = await storage.deleteUser(userId);
+    if (!deleted) {
+      return NextResponse.json<ApiResponse>({ success: false, message: '用户删除失败或不存在' }, { status: 404 });
+    }
+
+    return NextResponse.json<ApiResponse>({ success: true, message: '用户删除成功' });
+  } catch (error) {
+    console.error('❌ 删除用户失败:', error);
+    return NextResponse.json<ApiResponse>({ success: false, message: '服务器内部错误' }, { status: 500 });
+  }
+}
+EOF
+
+# 其他路由（简化）
 cat > src/app/api/check-expired/route.ts << 'EOF'
 import { NextResponse } from 'next/server';
 import { storage } from '@/lib/storage';
@@ -626,8 +729,8 @@ nohup pnpm start > /root/ssr-web.log 2>&1 &
 
 IP=$(hostname -I | awk '{print $1}')
 echo ""
-echo "🎉 SSR 管理系统部署成功！v23 · 最终完整版"
+echo "🎉 SSR 管理系统部署成功！v24 · 完整最终版"
 echo "🌐 访问地址: http://$IP:3000"
 echo "📄 日志文件: /root/ssr-web.log"
-echo "🔒 密码已自动 bcrypt 哈希存储"
-echo "✅ 所有 TypeScript 错误已修复，构建通过！"
+echo "🔒 支持用户创建/更新/删除，密码自动哈希"
+echo "✅ TypeScript 编译通过，Next.js 构建成功！"

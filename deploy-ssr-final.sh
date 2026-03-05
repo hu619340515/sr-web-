@@ -2,9 +2,9 @@
 
 set -e
 
-echo "🚀 开始 SSR 管理系统一键部署（v25.4 · 修复 ScheduledTask 类型缺失 + 保留 ServerStatus 修复）..."
+echo "🚀 开始 SSR 管理系统一键部署（v25.5 · 修复 test/page.tsx 中 User 类型不匹配问题）..."
 
-# === 1. Node.js 20 ===
+# === 1~6. 复用之前的环境准备（Node.js, Docker, Git clone 等）===
 CURRENT_NODE=$(node -v 2>/dev/null || echo "none")
 if [[ "$CURRENT_NODE" == "v18"* ]] || [[ "$CURRENT_NODE" == "none" ]]; then
   apt update
@@ -17,10 +17,8 @@ if [[ "$CURRENT_NODE" == "v18"* ]] || [[ "$CURRENT_NODE" == "none" ]]; then
   npm install -g pnpm
 fi
 
-# === 2. 基础依赖 ===
 DEBIAN_FRONTEND=noninteractive apt install -y git wget python3 python3-pip build-essential software-properties-common lsb-release
 
-# === 3. ShadowsocksR ===
 cd /opt
 [ ! -d "shadowsocksr" ] && git clone -b akkariiin/master https://github.com/shadowsocksrr/shadowsocksr.git
 mkdir -p /etc/shadowsocks
@@ -47,7 +45,6 @@ systemctl daemon-reload
 systemctl enable shadowsocksr
 systemctl start shadowsocksr || true
 
-# === 4. Docker + PostgreSQL ===
 if ! command -v docker &> /dev/null; then
   install -m 0755 -d /etc/apt/keyrings
   curl -fsSL https://download.docker.com/linux/ubuntu/gpg | gpg --dearmor -o /etc/apt/keyrings/docker.gpg
@@ -70,28 +67,24 @@ else
   docker start ssr-postgres 2>/dev/null || true
 fi
 
-# === 5. Web 项目 ===
 cd /root
 [ ! -d "sr-web-" ] && git clone https://github.com/hu619340515/sr-web-.git
 cd sr-web-
 
-# 设置环境变量
 cat > .env.local << 'EOF'
 DATABASE_URL=postgres://ssr_user:secure_password_123@localhost:5432/ssr_management
 NEXT_PUBLIC_SERVER_HOST=localhost
 EOF
 
-# 自动更新公网 IP
 PUBLIC_IP=$(curl -s https://api.ipify.org || hostname -I | awk '{print $1}')
 sed -i "s/NEXT_PUBLIC_SERVER_HOST=localhost/NEXT_PUBLIC_SERVER_HOST=$PUBLIC_IP/" .env.local
 
-# === 6. 修复 package.json ===
 sed -i 's|"build": *"[^"]*"|"build": "next build"|g' package.json || true
 if ! grep -q '"start"' package.json; then
   sed -i 's/"scripts": {/"scripts": {\n    "start": "next start",/g' package.json
 fi
 
-# === 7. 【关键】类型定义 —— v25.4 新增 ScheduledTask ===
+# === 7. 【关键】类型定义 —— 保持 v25.4 内容（含 ScheduledTask + 正确 User）===
 mkdir -p src/types
 
 cat > src/types/index.ts << 'EOF'
@@ -105,8 +98,8 @@ export interface User {
   method: string;
   protocol: string | null;
   obfs: string | null;
-  protoparam: string | null;
-  obfsparam: string | null;
+  protoparam: string | null;  // ← 注意拼写：小写 p
+  obfsparam: string | null;   // ← 小写 p
   trafficLimit: number; // MB
   trafficUsed: number;  // MB
   expiresAt: Date | null;
@@ -142,7 +135,7 @@ export interface UpdateUserRequest {
   status?: 'normal' | 'expired' | 'disabled';
 }
 
-// 服务器状态 —— 使用 ssrRunning: boolean
+// 服务器状态
 export interface ServerStatus {
   uptime: number;
   memory: { total: number; used: number; free: number };
@@ -152,13 +145,13 @@ export interface ServerStatus {
   timestamp: string;
 }
 
-// 【v25.4 新增】定时任务类型
+// 定时任务类型
 export interface ScheduledTask {
   id: number;
   name: string;
   description: string | null;
   cronExpression: string;
-  code: string; // 可执行的 JS 代码字符串
+  code: string;
   enabled: boolean;
   lastRun: Date | null;
   createdAt: Date;
@@ -183,7 +176,7 @@ export interface ApiResponse {
 }
 EOF
 
-# === 8. DB Schema ===
+# === 8. DB Schema（保持一致）===
 mkdir -p src/lib/db
 
 cat > src/lib/db/schema.ts << 'EOF'
@@ -226,7 +219,7 @@ const client = postgres(process.env.DATABASE_URL!, { prepare: false });
 export const db = drizzle(client, { schema });
 EOF
 
-# === 9. storage.ts（保持逻辑一致）===
+# === 9. storage.ts（保持逻辑）===
 cat > src/lib/storage.ts << 'EOF'
 import { eq, sql } from 'drizzle-orm';
 import { db } from '@/lib/db/client';
@@ -260,7 +253,6 @@ async function updateSSRConfig() {
   try { await execAsync('systemctl restart shadowsocksr'); } catch (e) { console.warn('⚠️ SSR 重启失败'); }
 }
 
-// --- Users ---
 export async function createUser(input: CreateUserRequest) {
   const expiresAt = input.expiresAt instanceof Date 
     ? input.expiresAt 
@@ -294,7 +286,6 @@ export async function updateUser(id: number, data: Partial<typeof users.$inferIn
 export async function deleteUser(id: number) { const r = await db.delete(users).where(eq(users.id, id)); await updateSSRConfig(); return r.count > 0; }
 export async function getUserByPort(port: number) { const r = await db.select().from(users).where(eq(users.port, port)).limit(1); return r[0]; }
 
-// --- Expired Users ---
 export async function checkExpiredUsers() {
   const now = new Date();
   return await db
@@ -309,7 +300,6 @@ export async function markUserExpired() {
   return r.length;
 }
 
-// --- Server Status ---
 export async function getServerStatus() {
   const uptime = Math.floor(os.uptime());
   const totalMem = os.totalmem();
@@ -358,7 +348,6 @@ export async function getServerStatus() {
   };
 }
 
-// --- Traffic Stats ---
 export async function getTrafficStats(userId?: string) {
   let query = db.select({
     id: users.id,
@@ -380,7 +369,6 @@ export async function getTrafficStats(userId?: string) {
   return await query;
 }
 
-// --- Scheduled Tasks ---
 export async function getScheduledTasks() {
   return await db.select().from(scheduledTasks).orderBy(scheduledTasks.id);
 }
@@ -412,9 +400,8 @@ export const storage = {
 };
 EOF
 
-# === 10. 修复 src/app/server/page.tsx（v25.3 逻辑）===
+# === 10~12. 修复 server/page.tsx + tasks/page.tsx（复用 v25.4）===
 mkdir -p src/app/server
-
 cat > src/app/server/page.tsx << 'EOF'
 "use client";
 
@@ -508,10 +495,7 @@ export default function ServerStatusPage() {
 }
 EOF
 
-# === 11. 【新增】确保 tasks/page.tsx 存在且兼容 ===
 mkdir -p src/app/tasks
-
-# 如果原文件存在，保留其结构但确保类型正确；若不存在则创建最小可用版
 cat > src/app/tasks/page.tsx << 'EOF'
 "use client";
 
@@ -525,7 +509,7 @@ import { Textarea } from "@/components/ui/textarea";
 import { Plus, Play, Trash2, Clock } from "lucide-react";
 import Link from "next/link";
 import { Navbar } from "@/components/navbar";
-import { ScheduledTask } from "@/types"; // ✅ 现在已定义
+import { ScheduledTask } from "@/types";
 
 export default function TasksPage() {
   const [tasks, setTasks] = useState<ScheduledTask[]>([]);
@@ -596,8 +580,150 @@ export default function TasksPage() {
 }
 EOF
 
-# === 12. API 路由：/api/tasks ===
-mkdir -p src/app/api/tasks
+# === 13. 【关键修复】src/app/test/page.tsx —— 构造合法 User 对象 ===
+mkdir -p src/app/test
+
+cat > src/app/test/page.tsx << 'EOF'
+"use client";
+
+import { useState } from "react";
+import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
+import { Input } from "@/components/ui/input";
+import { Label } from "@/components/ui/label";
+import { Button } from "@/components/ui/button";
+import { Copy, LinkIcon } from "lucide-react";
+import { Navbar } from "@/components/navbar";
+import { User } from "@/types"; // ✅ 正确导入
+
+// 模拟 SSR 配置
+const testConfig = {
+  server: "your-server-ip",
+  serverPort: 443,
+};
+
+// ✅ 【v25.5 修复】构造完全符合 User 接口的测试对象
+const testUser: User = {
+  id: 1,
+  username: "testuser",
+  email: "test@example.com",
+  passwordHash: "fake_hashed_password_123", // ← 不是 password
+  port: 10001,
+  method: "aes-256-cfb",
+  protocol: "auth_chain_a",
+  obfs: "tls1.2_ticket_auth",
+  protoparam: "",   // ← 正确字段名（小写 p）
+  obfsparam: "",    // ← 正确字段名
+  trafficLimit: 102400, // 100 GB
+  trafficUsed: 0,
+  expiresAt: new Date("2030-12-31"),
+  status: "normal", // ← 合法值
+  createdAt: new Date("2025-01-01"),
+};
+
+// 模拟生成 SSR 链接（简化版）
+function generateSSRLink(user: User, server: string, serverPort: number): string {
+  const {
+    port,
+    passwordHash: password,
+    method,
+    protocol = "origin",
+    obfs = "plain",
+    protoparam = "",
+    obfsparam = "",
+  } = user;
+
+  const params = [
+    `obfs=${encodeURIComponent(obfs)}`,
+    `obfsparam=${encodeURIComponent(obfsparam)}`,
+    `protoparam=${encodeURIComponent(protoparam)}`,
+    `protocol=${encodeURIComponent(protocol)}`,
+    `remarks=${encodeURIComponent(user.username)}`,
+    `group=SSR_GROUP`,
+  ].join('&');
+
+  const link = `ssr://${btoa(
+    `${server}:${port}:${protocol}:${method}:${obfs}:${btoa(password)}?${params}`
+  )}`;
+  return link;
+}
+
+// 模拟复制
+async function copySSRLink(link: string): Promise<boolean> {
+  try {
+    await navigator.clipboard.writeText(link);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+export default function TestPage() {
+  const ssrLink = generateSSRLink(testUser, testConfig.server, testConfig.serverPort);
+  const [copied, setCopied] = useState(false);
+
+  const handleCopy = async () => {
+    const success = await copySSRLink(ssrLink);
+    if (success) {
+      setCopied(true);
+      setTimeout(() => setCopied(false), 2000);
+    }
+  };
+
+  return (
+    <div className="min-h-screen bg-background">
+      <Navbar />
+      <div className="container mx-auto py-8">
+        <Card>
+          <CardHeader>
+            <CardTitle>SSR 链接测试</CardTitle>
+          </CardHeader>
+          <CardContent className="space-y-4">
+            <div>
+              <Label>SSR 链接</Label>
+              <div className="flex mt-1">
+                <Input value={ssrLink} readOnly className="rounded-r-none" />
+                <Button onClick={handleCopy} className="rounded-l-none">
+                  {copied ? "已复制!" : <Copy className="h-4 w-4" />}
+                </Button>
+              </div>
+            </div>
+            <div className="text-sm text-muted-foreground">
+              <p>服务器: {testConfig.server}:{testConfig.serverPort}</p>
+              <p>端口: {testUser.port}, 加密: {testUser.method}</p>
+              <p>协议: {testUser.protocol}, 混淆: {testUser.obfs}</p>
+            </div>
+          </CardContent>
+        </Card>
+      </div>
+    </div>
+  );
+}
+EOF
+
+# === 14. API 路由（简略）===
+mkdir -p src/app/api/server src/app/api/tasks
+cat > src/app/api/server/route.ts << 'EOF'
+import { NextResponse } from 'next/server';
+import { storage } from '@/lib/storage';
+import { ApiResponse } from '@/types';
+
+export async function GET() {
+  try {
+    const status = await storage.getServerStatus();
+    return NextResponse.json<ApiResponse>({
+      success: true,
+      message: '服务器状态获取成功',
+      data: status,
+    });
+  } catch (error) {
+    console.error('❌ 获取服务器状态失败:', error);
+    return NextResponse.json<ApiResponse>(
+      { success: false, message: '服务器内部错误' },
+      { status: 500 }
+    );
+  }
+}
+EOF
 
 cat > src/app/api/tasks/route.ts << 'EOF'
 import { NextResponse } from 'next/server';
@@ -615,7 +741,7 @@ export async function GET() {
 }
 EOF
 
-# === 13. Drizzle Config ===
+# === 15. Drizzle & 依赖 ===
 cat > drizzle.config.ts << 'EOF'
 import type { Config } from 'drizzle-kit';
 import { config } from 'dotenv';
@@ -632,12 +758,10 @@ export default {
 } satisfies Config;
 EOF
 
-# === 14. 安装依赖 ===
 pnpm install
 pnpm add next react react-dom drizzle-orm pg postgres bcrypt
 pnpm add -D drizzle-kit tsx @types/bcrypt dotenv @types/node typescript
 
-# === 15. 幂等迁移 ===
 TABLES_EXIST=false
 if docker exec ssr-postgres psql -U ssr_user -d ssr_management -tAc "SELECT EXISTS (SELECT FROM information_schema.tables WHERE table_name = 'users')" | grep -q "t"; then
   if docker exec ssr-postgres psql -U ssr_user -d ssr_management -tAc "SELECT EXISTS (SELECT FROM information_schema.tables WHERE table_name = 'scheduled_tasks')" | grep -q "t"; then
@@ -681,8 +805,10 @@ nohup pnpm start > /root/ssr-web.log 2>&1 &
 
 IP=$(hostname -I | awk '{print $1}')
 echo ""
-echo "🎉 SSR 管理系统部署成功！v25.4 · 修复 ScheduledTask 类型缺失 + ServerStatus 修复"
+echo "🎉 SSR 管理系统部署成功！v25.5 · 修复 test/page.tsx 中 User 类型不匹配问题"
 echo "🌐 访问地址: http://$IP:3000"
 echo "📄 日志文件: /root/ssr-web.log"
-echo "✅ TypeScript 编译通过，Next.js 构建成功！"
-echo "✅ 所有类型：ServerStatus、ScheduledTask、User 均已正确定义"
+echo "✅ 所有 TypeScript 错误已修复："
+echo "   - ServerStatus 使用 ssrRunning（boolean）"
+echo "   - ScheduledTask 类型已导出"
+echo "   - testUser 符合 User 接口（passwordHash, protoparam, obfsparam, status='normal'）"

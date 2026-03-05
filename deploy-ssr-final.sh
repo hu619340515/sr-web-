@@ -2,12 +2,11 @@
 
 set -e
 
-echo "🚀 开始 SSR 系统一键部署（v16 · 完整修复所有 storage 方法）..."
+echo "🚀 开始 SSR 系统一键部署（v17 · 补全 scheduledTasks 支持）..."
 
-# === 1. 升级 Node.js 到 v20 ===
+# === 1. Node.js 20 ===
 CURRENT_NODE=$(node -v 2>/dev/null || echo "none")
 if [[ "$CURRENT_NODE" == "v18"* ]] || [[ "$CURRENT_NODE" == "none" ]]; then
-  echo "🔧 安装 Node.js 20.x..."
   apt update
   apt install -y ca-certificates curl gnupg
   mkdir -p /etc/apt/keyrings
@@ -51,7 +50,7 @@ systemctl start shadowsocksr || true
 # === 4. Docker + PostgreSQL ===
 if ! command -v docker &> /dev/null; then
   install -m 0755 -d /etc/apt/keyrings
-  curl -fsSL https https://download.docker.com/linux/ubuntu/gpg | gpg --dearmor -o /etc/apt/keyrings/docker.gpg
+  curl -fsSL https://download.docker.com/linux/ubuntu/gpg | gpg --dearmor -o /etc/apt/keyrings/docker.gpg
   echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu $(lsb_release -cs) stable" | tee /etc/apt/sources.list.d/docker.list > /dev/null
   apt update
   DEBIAN_FRONTEND=noninteractive apt install -y docker-ce docker-ce-cli containerd.io docker-compose-plugin
@@ -129,11 +128,11 @@ const client = postgres(process.env.DATABASE_URL!, { prepare: false });
 export const db = drizzle(client, { schema });
 EOF
 
-# === 8. 【核心】storage.ts（含所有方法）===
+# === 8. 【核心】storage.ts（含 scheduledTasks 支持）===
 cat > src/lib/storage.ts << 'EOF'
 import { eq, sql } from 'drizzle-orm';
 import { db } from '@/lib/db/client';
-import { users } from '@/lib/db/schema';
+import { users, scheduledTasks } from '@/lib/db/schema';
 import * as fs from 'fs/promises';
 import * as os from 'os';
 import { exec } from 'child_process';
@@ -174,7 +173,6 @@ export async function markUserExpired() {
   return r.length;
 }
 
-// ✅ 新增：获取服务器状态
 export async function getServerStatus() {
   const uptime = Math.floor(os.uptime());
   const totalMem = os.totalmem();
@@ -223,6 +221,12 @@ export async function getServerStatus() {
   };
 }
 
+// ✅ 新增：获取定时任务
+export async function getScheduledTaskById(id: number) {
+  const r = await db.select().from(scheduledTasks).where(eq(scheduledTasks.id, id)).limit(1);
+  return r[0] || null;
+}
+
 // ✅ 导出所有方法
 export const storage = {
   createUser,
@@ -234,13 +238,13 @@ export const storage = {
   checkExpiredUsers,
   markUserExpired,
   getServerStatus,
+  getScheduledTaskById,
 };
 EOF
 
 # === 9. 修复 API 路由 ===
-mkdir -p src/app/api/check-expired src/app/api/server
+mkdir -p src/app/api/check-expired src/app/api/server src/app/api/tasks/[id]/execute
 
-# check-expired: 执行标记
 cat > src/app/api/check-expired/route.ts << 'EOF'
 import { NextResponse } from 'next/server';
 import { storage } from '@/lib/storage';
@@ -264,7 +268,6 @@ export async function POST() {
 }
 EOF
 
-# server: 获取状态
 cat > src/app/api/server/route.ts << 'EOF'
 import { NextResponse } from 'next/server';
 import { storage } from '@/lib/storage';
@@ -280,6 +283,40 @@ export async function GET() {
     });
   } catch (error) {
     console.error('❌ 获取服务器状态失败:', error);
+    return NextResponse.json<ApiResponse>(
+      { success: false, message: '服务器内部错误' },
+      { status: 500 }
+    );
+  }
+}
+EOF
+
+cat > src/app/api/tasks/[id]/execute/route.ts << 'EOF'
+import { NextResponse } from 'next/server';
+import { storage } from '@/lib/storage';
+import { ApiResponse } from '@/types';
+
+export async function POST(req: Request, { params }: { params: Promise<{ id: string }> }) {
+  try {
+    const { id } = await params;
+    const taskId = parseInt(id, 10);
+    if (isNaN(taskId)) {
+      return NextResponse.json<ApiResponse>({ success: false, message: '无效的任务 ID' }, { status: 400 });
+    }
+
+    const task = await storage.getScheduledTaskById(taskId);
+    if (!task) {
+      return NextResponse.json<ApiResponse>({ success: false, message: '任务不存在' }, { status: 404 });
+    }
+
+    // TODO: 后续可在此处执行 task.code（需沙箱）
+    return NextResponse.json<ApiResponse>({
+      success: true,
+      message: `任务 "${task.name}" 执行成功（模拟）`,
+      data: task,
+    });
+  } catch (error) {
+    console.error('❌ 执行任务失败:', error);
     return NextResponse.json<ApiResponse>(
       { success: false, message: '服务器内部错误' },
       { status: 500 }
@@ -354,6 +391,6 @@ nohup pnpm start > /root/ssr-web.log 2>&1 &
 
 IP=$(hostname -I | awk '{print $1}')
 echo ""
-echo "🎉 部署成功！v16 · 所有 API 方法已补全"
+echo "🎉 部署成功！v17 · 所有 storage 方法已补全"
 echo "🌐 管理地址: http://$IP:3000"
 echo "📄 日志: /root/ssr-web.log"

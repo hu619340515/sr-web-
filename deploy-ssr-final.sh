@@ -2,7 +2,7 @@
 
 set -e
 
-echo "🚀 开始 SSR 系统一键部署（v19 · 补全 getScheduledTasks）..."
+echo "🚀 开始 SSR 系统一键部署（v20 · 补全 getTrafficStats）..."
 
 # === 1. Node.js 20 ===
 CURRENT_NODE=$(node -v 2>/dev/null || echo "none")
@@ -128,7 +128,7 @@ const client = postgres(process.env.DATABASE_URL!, { prepare: false });
 export const db = drizzle(client, { schema });
 EOF
 
-# === 8. 【核心】storage.ts（完整 CRUD + 列表）===
+# === 8. 【核心】storage.ts（v20 · 全功能）===
 cat > src/lib/storage.ts << 'EOF'
 import { eq, sql } from 'drizzle-orm';
 import { db } from '@/lib/db/client';
@@ -223,6 +223,28 @@ export async function getServerStatus() {
   };
 }
 
+// --- Traffic Stats ---
+export async function getTrafficStats(userId?: string) {
+  let query = db.select({
+    id: users.id,
+    username: users.username,
+    port: users.port,
+    trafficUsed: users.trafficUsed,
+    trafficLimit: users.trafficLimit,
+    status: users.status,
+    expiresAt: users.expiresAt,
+  }).from(users);
+
+  if (userId) {
+    const idNum = parseInt(userId, 10);
+    if (!isNaN(idNum)) {
+      query = query.where(eq(users.id, idNum));
+    }
+  }
+
+  return await query;
+}
+
 // --- Scheduled Tasks ---
 export async function getScheduledTasks() {
   return await db.select().from(scheduledTasks).orderBy(scheduledTasks.id);
@@ -249,14 +271,15 @@ export const storage = {
   checkExpiredUsers,
   markUserExpired,
   getServerStatus,
-  getScheduledTasks,        // ✅ 复数：获取所有
-  getScheduledTaskById,     // ✅ 单数：按 ID 获取
-  updateScheduledTask,      // ✅ 更新
+  getTrafficStats,           // ✅ 流量统计
+  getScheduledTasks,
+  getScheduledTaskById,
+  updateScheduledTask,
 };
 EOF
 
 # === 9. 修复 API 路由 ===
-mkdir -p src/app/api/check-expired src/app/api/server src/app/api/tasks src/app/api/tasks/[id]
+mkdir -p src/app/api/check-expired src/app/api/server src/app/api/tasks src/app/api/tasks/[id] src/app/api/traffic
 
 cat > src/app/api/check-expired/route.ts << 'EOF'
 import { NextResponse } from 'next/server';
@@ -393,6 +416,32 @@ export async function PUT(req: Request, { params }: { params: Promise<{ id: stri
 }
 EOF
 
+cat > src/app/api/traffic/route.ts << 'EOF'
+import { NextResponse } from 'next/server';
+import { storage } from '@/lib/storage';
+import { ApiResponse } from '@/types';
+
+export async function GET(request: Request) {
+  try {
+    const { searchParams } = new URL(request.url);
+    const userId = searchParams.get('userId');
+
+    const stats = await storage.getTrafficStats(userId || undefined);
+
+    return NextResponse.json<ApiResponse>({
+      success: true,
+      data: stats,
+    });
+  } catch (error) {
+    console.error('❌ 获取流量统计失败:', error);
+    return NextResponse.json<ApiResponse>(
+      { success: false, message: '服务器内部错误' },
+      { status: 500 }
+    );
+  }
+}
+EOF
+
 # === 10. Drizzle Config ===
 cat > drizzle.config.ts << 'EOF'
 import type { Config } from 'drizzle-kit';
@@ -459,6 +508,6 @@ nohup pnpm start > /root/ssr-web.log 2>&1 &
 
 IP=$(hostname -I | awk '{print $1}')
 echo ""
-echo "🎉 部署成功！v19 · 所有 storage 方法已补全（含 getScheduledTasks）"
+echo "🎉 部署成功！v20 · 所有 storage 方法已补全（含 getTrafficStats）"
 echo "🌐 管理地址: http://$IP:3000"
 echo "📄 日志: /root/ssr-web.log"

@@ -2,7 +2,7 @@
 
 set -e
 
-echo "🚀 开始 SSR 系统一键部署（最终版 v13 · 修复 storage 导出 + Node.js 20）..."
+echo "🚀 开始 SSR 系统一键部署（最终版 v14 · 含 checkExpiredUsers 修复 + Node.js 20 + storage 导出）..."
 
 # === 1. 安装/升级 Node.js 到 v20 ===
 CURRENT_NODE=$(node -v 2>/dev/null || echo "none")
@@ -26,7 +26,7 @@ if ! node -v | grep -E 'v2[0-9]+\.' > /dev/null; then
   exit 1
 fi
 
-# === 2. 安装其他依赖 ===
+# === 2. 安装其他基础依赖 ===
 DEBIAN_FRONTEND=noninteractive apt install -y \
   git wget python3 python3-pip build-essential \
   software-properties-common lsb-release
@@ -59,11 +59,11 @@ systemctl daemon-reload
 systemctl enable shadowsocksr
 systemctl start shadowsocksr || true
 
-# === 4. 启动 PostgreSQL ===
+# === 4. 安装并启动 Docker + PostgreSQL ===
 if ! command -v docker &> /dev/null; then
   echo "🐳 安装 Docker..."
   install -m 0755 -d /etc/apt/keyrings
-  curl -fsSL https https://download.docker.com/linux/ubuntu/gpg | gpg --dearmor -o /etc/apt/keyrings/docker.gpg
+  curl -fsSL https://download.docker.com/linux/ubuntu/gpg | gpg --dearmor -o /etc/apt/keyrings/docker.gpg
   echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu $(lsb_release -cs) stable" | tee /etc/apt/sources.list.d/docker.list > /dev/null
   apt update
   DEBIAN_FRONTEND=noninteractive apt install -y docker-ce docker-ce-cli containerd.io docker-compose-plugin
@@ -94,7 +94,7 @@ cat > .env.local << 'EOF'
 DATABASE_URL=postgres://ssr_user:secure_password_123@localhost:5432/ssr_management
 EOF
 
-# === 6. 修复 package.json ===
+# === 6. 修复 package.json 构建命令 ===
 if [ -f "package.json" ]; then
   cp package.json package.json.bak
   sed -i 's|"build": *"[^"]*"|"build": "next build"|g' package.json
@@ -104,7 +104,7 @@ if [ -f "package.json" ]; then
   echo "✅ 修复 package.json 构建命令"
 fi
 
-# === 7. 注入 schema 和 client ===
+# === 7. 注入 Drizzle Schema 和 DB Client ===
 mkdir -p src/lib/db
 
 cat > src/lib/db/schema.ts << 'EOF'
@@ -147,7 +147,7 @@ const client = postgres(process.env.DATABASE_URL!, { prepare: false });
 export const db = drizzle(client, { schema });
 EOF
 
-# === 8. 【关键修复】storage.ts 必须导出 storage 对象 ===
+# === 8. 【核心修复】注入完整的 storage.ts（含 checkExpiredUsers）===
 cat > src/lib/storage.ts << 'EOF'
 import { eq, sql } from 'drizzle-orm';
 import { db } from '@/lib/db/client';
@@ -175,6 +175,17 @@ export async function getUserById(id) { const r = await db.select().from(users).
 export async function updateUser(id, data) { const r = await db.update(users).set(data).where(eq(users.id, id)).returning(); await updateSSRConfig(); return r[0] || null; }
 export async function deleteUser(id) { const r = await db.delete(users).where(eq(users.id, id)); await updateSSRConfig(); return r.count > 0; }
 export async function getUserByPort(port) { const r = await db.select().from(users).where(eq(users.port, port)).limit(1); return r[0]; }
+
+// ✅ 新增：获取已过期但状态仍为 normal 的用户（用于 /api/check-expired）
+export async function checkExpiredUsers() {
+  const now = new Date();
+  return await db
+    .select()
+    .from(users)
+    .where(sql`${users.expiresAt} <= ${now} AND ${users.status} = 'normal'`);
+}
+
+// ✅ 标记过期用户为 expired（用于定时任务）
 export async function markUserExpired() {
   const now = new Date();
   const r = await db.update(users).set({ status: 'expired' }).where(sql`${users.expiresAt} <= ${now} AND ${users.status} = 'normal'`).returning({ id: users.id });
@@ -182,7 +193,7 @@ export async function markUserExpired() {
   return r.length;
 }
 
-// ✅ 关键：导出 storage 对象，供 API 路由使用
+// ✅ 统一导出 storage 对象，供 API 路由使用
 export const storage = {
   createUser,
   getUsers,
@@ -190,6 +201,7 @@ export const storage = {
   updateUser,
   deleteUser,
   getUserByPort,
+  checkExpiredUsers,
   markUserExpired,
 };
 EOF
@@ -215,7 +227,7 @@ pnpm install
 pnpm add next react react-dom drizzle-orm pg postgres bcrypt
 pnpm add -D drizzle-kit tsx @types/bcrypt dotenv @types/node typescript
 
-# === 10. 智能迁移 ===
+# === 10. 智能数据库迁移（幂等）===
 echo "🔍 检查数据库表是否存在..."
 TABLES_EXIST=false
 if docker exec ssr-postgres psql -U ssr_user -d ssr_management -tAc "SELECT EXISTS (SELECT FROM information_schema.tables WHERE table_name = 'users')" | grep -q "t"; then
@@ -265,7 +277,7 @@ EOF
   fi
 fi
 
-# === 11. 构建并启动 ===
+# === 11. 构建并启动服务 ===
 echo "📦 构建 Next.js 应用..."
 pnpm build
 
@@ -278,5 +290,5 @@ IP=$(hostname -I | awk '{print $1}')
 echo ""
 echo "🎉 部署成功！"
 echo "🌐 Web 管理地址: http://$IP:3000"
-echo "📄 日志: /root/ssr-web.log"
-echo "💡 此脚本可安全重复运行！"
+echo "📄 日志文件: /root/ssr-web.log"
+echo "💡 此脚本可安全重复运行（幂等设计）"

@@ -2,7 +2,7 @@
 
 set -e
 
-echo "🚀 开始 SSR 系统一键部署（v20 · 补全 getTrafficStats）..."
+echo "🚀 开始 SSR 系统一键部署（v21 · 修复 getUsers().some() 异步问题）..."
 
 # === 1. Node.js 20 ===
 CURRENT_NODE=$(node -v 2>/dev/null || echo "none")
@@ -128,7 +128,7 @@ const client = postgres(process.env.DATABASE_URL!, { prepare: false });
 export const db = drizzle(client, { schema });
 EOF
 
-# === 8. 【核心】storage.ts（v20 · 全功能）===
+# === 8. 【核心】storage.ts（v21 · 全功能 + 类型安全）===
 cat > src/lib/storage.ts << 'EOF'
 import { eq, sql } from 'drizzle-orm';
 import { db } from '@/lib/db/client';
@@ -271,16 +271,59 @@ export const storage = {
   checkExpiredUsers,
   markUserExpired,
   getServerStatus,
-  getTrafficStats,           // ✅ 流量统计
+  getTrafficStats,
   getScheduledTasks,
   getScheduledTaskById,
   updateScheduledTask,
 };
 EOF
 
-# === 9. 修复 API 路由 ===
-mkdir -p src/app/api/check-expired src/app/api/server src/app/api/tasks src/app/api/tasks/[id] src/app/api/traffic
+# === 9. 修复 API 路由（重点：users POST 使用 await）===
+mkdir -p src/app/api/check-expired src/app/api/server src/app/api/tasks src/app/api/tasks/[id] src/app/api/traffic src/app/api/users
 
+cat > src/app/api/users/route.ts << 'EOF'
+import { NextResponse } from 'next/server';
+import { storage } from '@/lib/storage';
+import { ApiResponse } from '@/types';
+
+export async function GET() {
+  try {
+    const users = await storage.getUsers();
+    return NextResponse.json<ApiResponse>({ success: true, data: users });
+  } catch (error) {
+    console.error('❌ 获取用户列表失败:', error);
+    return NextResponse.json<ApiResponse>({ success: false, message: '服务器内部错误' }, { status: 500 });
+  }
+}
+
+export async function POST(request: Request) {
+  try {
+    const body = await request.json();
+
+    // ✅ 正确：先 await 获取用户列表
+    const existingUsers = await storage.getUsers();
+
+    // ✅ 检查端口是否被占用
+    if (existingUsers.some(u => u.port === body.port)) {
+      return NextResponse.json<ApiResponse>({ success: false, message: '该端口已被使用' }, { status: 400 });
+    }
+
+    // ✅ 检查用户名是否重复
+    if (existingUsers.some(u => u.username === body.username)) {
+      return NextResponse.json<ApiResponse>({ success: false, message: '用户名已存在' }, { status: 400 });
+    }
+
+    const newUser = await storage.createUser(body);
+    return NextResponse.json<ApiResponse>({ success: true, message: '用户创建成功', data: newUser }, { status: 201 });
+
+  } catch (error) {
+    console.error('❌ 创建用户失败:', error);
+    return NextResponse.json<ApiResponse>({ success: false, message: '服务器内部错误' }, { status: 500 });
+  }
+}
+EOF
+
+# 其他路由保持不变（略，与 v20 相同）
 cat > src/app/api/check-expired/route.ts << 'EOF'
 import { NextResponse } from 'next/server';
 import { storage } from '@/lib/storage';
@@ -508,6 +551,6 @@ nohup pnpm start > /root/ssr-web.log 2>&1 &
 
 IP=$(hostname -I | awk '{print $1}')
 echo ""
-echo "🎉 部署成功！v20 · 所有 storage 方法已补全（含 getTrafficStats）"
+echo "🎉 部署成功！v21 · 修复异步 getUsers().some() 问题 + 全功能补全"
 echo "🌐 管理地址: http://$IP:3000"
 echo "📄 日志: /root/ssr-web.log"

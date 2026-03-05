@@ -2,7 +2,7 @@
 
 set -e
 
-echo "🚀 开始 SSR 系统一键部署（v17 · 补全 scheduledTasks 支持）..."
+echo "🚀 开始 SSR 系统一键部署（v18 · 补全 scheduledTasks 的更新支持）..."
 
 # === 1. Node.js 20 ===
 CURRENT_NODE=$(node -v 2>/dev/null || echo "none")
@@ -128,7 +128,7 @@ const client = postgres(process.env.DATABASE_URL!, { prepare: false });
 export const db = drizzle(client, { schema });
 EOF
 
-# === 8. 【核心】storage.ts（含 scheduledTasks 支持）===
+# === 8. 【核心】storage.ts（完整 CRUD 支持）===
 cat > src/lib/storage.ts << 'EOF'
 import { eq, sql } from 'drizzle-orm';
 import { db } from '@/lib/db/client';
@@ -146,6 +146,7 @@ async function updateSSRConfig() {
   try { await execAsync('systemctl restart shadowsocksr'); } catch (e) { console.warn('⚠️ SSR 重启失败'); }
 }
 
+// --- Users ---
 export async function createUser(input) {
   const userData = { username: input.username, email: input.email, passwordHash: input.password, port: input.port, method: input.method, protocol: input.protocol || 'origin', obfs: input.obfs || 'plain', protoparam: '', obfsparam: '', trafficLimit: input.trafficLimit, expiresAt: input.expiresAt, status: 'normal' };
   const result = await db.insert(users).values(userData).returning();
@@ -158,6 +159,7 @@ export async function updateUser(id, data) { const r = await db.update(users).se
 export async function deleteUser(id) { const r = await db.delete(users).where(eq(users.id, id)); await updateSSRConfig(); return r.count > 0; }
 export async function getUserByPort(port) { const r = await db.select().from(users).where(eq(users.port, port)).limit(1); return r[0]; }
 
+// --- Expired Users ---
 export async function checkExpiredUsers() {
   const now = new Date();
   return await db
@@ -165,14 +167,14 @@ export async function checkExpiredUsers() {
     .from(users)
     .where(sql`${users.expiresAt} <= ${now} AND ${users.status} = 'normal'`);
 }
-
 export async function markUserExpired() {
   const now = new Date();
-  const r = await db.update(users).set({ status: 'expired' }).where(sql`${users.expiresAt} <= ${now} AND ${users.status} = 'normal'`).returning({ id: users.id });
+  const r = await db.update(users).set({ status: 'expired' }).where(sql`${users.expiresAt} <= ${now} AND ${users.status} = 'normal'}`).returning({ id: users.id });
   await updateSSRConfig();
   return r.length;
 }
 
+// --- Server Status ---
 export async function getServerStatus() {
   const uptime = Math.floor(os.uptime());
   const totalMem = os.totalmem();
@@ -221,9 +223,14 @@ export async function getServerStatus() {
   };
 }
 
-// ✅ 新增：获取定时任务
+// --- Scheduled Tasks ---
 export async function getScheduledTaskById(id: number) {
   const r = await db.select().from(scheduledTasks).where(eq(scheduledTasks.id, id)).limit(1);
+  return r[0] || null;
+}
+
+export async function updateScheduledTask(id: number, data: Partial<typeof scheduledTasks.$inferInsert>) {
+  const r = await db.update(scheduledTasks).set(data).where(eq(scheduledTasks.id, id)).returning();
   return r[0] || null;
 }
 
@@ -239,11 +246,12 @@ export const storage = {
   markUserExpired,
   getServerStatus,
   getScheduledTaskById,
+  updateScheduledTask,
 };
 EOF
 
 # === 9. 修复 API 路由 ===
-mkdir -p src/app/api/check-expired src/app/api/server src/app/api/tasks/[id]/execute
+mkdir -p src/app/api/check-expired src/app/api/server src/app/api/tasks/[id]
 
 cat > src/app/api/check-expired/route.ts << 'EOF'
 import { NextResponse } from 'next/server';
@@ -309,7 +317,6 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
       return NextResponse.json<ApiResponse>({ success: false, message: '任务不存在' }, { status: 404 });
     }
 
-    // TODO: 后续可在此处执行 task.code（需沙箱）
     return NextResponse.json<ApiResponse>({
       success: true,
       message: `任务 "${task.name}" 执行成功（模拟）`,
@@ -317,6 +324,40 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
     });
   } catch (error) {
     console.error('❌ 执行任务失败:', error);
+    return NextResponse.json<ApiResponse>(
+      { success: false, message: '服务器内部错误' },
+      { status: 500 }
+    );
+  }
+}
+EOF
+
+cat > src/app/api/tasks/[id]/route.ts << 'EOF'
+import { NextResponse } from 'next/server';
+import { storage } from '@/lib/storage';
+import { ApiResponse } from '@/types';
+
+export async function PUT(req: Request, { params }: { params: Promise<{ id: string }> }) {
+  try {
+    const { id } = await params;
+    const body = await req.json();
+    const taskId = parseInt(id, 10);
+    if (isNaN(taskId)) {
+      return NextResponse.json<ApiResponse>({ success: false, message: '无效的任务 ID' }, { status: 400 });
+    }
+
+    const updatedTask = await storage.updateScheduledTask(taskId, body);
+    if (!updatedTask) {
+      return NextResponse.json<ApiResponse>({ success: false, message: '任务更新失败或不存在' }, { status: 404 });
+    }
+
+    return NextResponse.json<ApiResponse>({
+      success: true,
+      message: '任务更新成功',
+      data: updatedTask,
+    });
+  } catch (error) {
+    console.error('❌ 更新任务失败:', error);
     return NextResponse.json<ApiResponse>(
       { success: false, message: '服务器内部错误' },
       { status: 500 }
@@ -391,6 +432,6 @@ nohup pnpm start > /root/ssr-web.log 2>&1 &
 
 IP=$(hostname -I | awk '{print $1}')
 echo ""
-echo "🎉 部署成功！v17 · 所有 storage 方法已补全"
+echo "🎉 部署成功！v18 · 所有 storage 方法已补全（含 scheduledTasks 更新）"
 echo "🌐 管理地址: http://$IP:3000"
 echo "📄 日志: /root/ssr-web.log"
